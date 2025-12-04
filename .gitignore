@@ -1,0 +1,20 @@
+# ESP-IDF build artifacts
+build/
+sdkconfig
+sdkconfig.old
+*.swp
+*.swo
+*~
+
+# Python
+__pycache__/
+*.pyc
+
+# IDE
+.vscode/
+.idea/
+*.code-workspace
+
+# Dependencies
+dependencies.lock
+managed_components/
