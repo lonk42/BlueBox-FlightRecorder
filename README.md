@@ -71,20 +71,47 @@ idf.py -p /dev/ttyUSB0 flash monitor
 
 ## Operation
 
-1. **Power On**: Single beep
-2. **Sensors Initialized**: Two beeps
-3. **Recording**: Device records for 30 seconds max
-4. **Recording Complete**: Three beeps
-5. **WiFi AP Ready**: Continuous tone
+BlueBox automatically transitions through three modes based on detected motion:
 
-### WiFi Access
-- SSID: `BlueBox`
-- Password: `bluebox123`
-- Data endpoint: `http://192.168.4.1/data`
+### 1. Launch Mode (Pre-Flight)
+- **Start**: After sensor initialization (2 beeps)
+- **Audio**: Two-tone beep (low→high) every 3 seconds
+- **Behavior**: Records continuously, maintains 1-second data window
+- **Transition**: Automatically enters Flight Mode when launch detected (gyro >150 deg/s for 250ms)
+
+### 2. Flight Mode (In-Flight)
+- **Audio**: Continuous 1500Hz tone
+- **Behavior**: Full continuous recording (~1.3 seconds buffer capacity)
+- **Transition**: Automatically enters Recovery Mode when landing detected (gyro <10 deg/s for 1 second)
+
+### 3. Recovery Mode (Post-Flight)
+- **Audio**: Triple ascending tone every 6 seconds
+- **Behavior**: WiFi AP activates, data available for download
+- **WiFi Access**:
+  - SSID: `BlueBox`
+  - Password: `bluebox123`
+  - Data endpoint: `http://192.168.4.1/data`
+
+### Startup Sequence
+1. **Power On**: Single beep
+2. **Sensors Initialized**: Two beeps → enters Launch Mode
+3. System automatically manages all mode transitions
 
 ## System Architecture
 
 - **Core 0**: High-speed sensor polling (MPU6500: 1kHz, BMP280: 100Hz)
-- **Core 1**: State management, WiFi, HTTP server
-- **Storage**: 2MB circular buffer in RAM
+- **Core 1**: State management, beep task, WiFi, HTTP server
+- **Storage**: 64KB circular buffer in RAM (~1.3 seconds at 1kHz)
 - **Sampling Rate**: ~1000Hz for gyro/accel, ~100Hz for pressure/temperature
+- **State Machine**: Automatic transitions (Launch → Flight → Recovery) based on gyroscope data
+- **Launch Detection**: Gyro magnitude >150 deg/s for 250ms
+- **Landing Detection**: Gyro magnitude <10 deg/s for 1 second
+
+## Audio Feedback
+
+- **Single beep**: Power on
+- **Two beeps**: Sensors ready, entering Launch Mode
+- **Two-tone pair every 3s**: Launch Mode active
+- **Continuous tone (1500Hz)**: Flight Mode active
+- **Triple ascending tone every 6s**: Recovery Mode active (WiFi ready)
+- **SOS pattern**: Error state

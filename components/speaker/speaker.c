@@ -112,3 +112,40 @@ void speaker_stop(void)
     ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, 0);
     ledc_update_duty(LEDC_MODE, LEDC_CHANNEL);
 }
+
+esp_err_t speaker_two_tone_pair(void)
+{
+    // Low tone
+    speaker_tone(800, 150);
+    vTaskDelay(pdMS_TO_TICKS(100));
+    // High tone
+    speaker_tone(1200, 150);
+    return ESP_OK;
+}
+
+esp_err_t speaker_triple_tone(void)
+{
+    // Three ascending tones
+    speaker_tone(800, 150);
+    vTaskDelay(pdMS_TO_TICKS(100));
+    speaker_tone(1000, 150);
+    vTaskDelay(pdMS_TO_TICKS(100));
+    speaker_tone(1200, 150);
+    return ESP_OK;
+}
+
+esp_err_t speaker_start_continuous(uint32_t frequency_hz)
+{
+    // Set frequency
+    esp_err_t err = ledc_set_freq(LEDC_MODE, LEDC_TIMER, frequency_hz);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to set frequency: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    // Set duty cycle (50%) and keep playing
+    ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, LEDC_DUTY);
+    ledc_update_duty(LEDC_MODE, LEDC_CHANNEL);
+
+    return ESP_OK;
+}

@@ -42,4 +42,26 @@ esp_err_t speaker_beep_sos(void);
  */
 void speaker_stop(void);
 
+/**
+ * @brief Play a two-tone pair (low then high)
+ *
+ * @return esp_err_t ESP_OK on success
+ */
+esp_err_t speaker_two_tone_pair(void);
+
+/**
+ * @brief Play a triple-tone pattern
+ *
+ * @return esp_err_t ESP_OK on success
+ */
+esp_err_t speaker_triple_tone(void);
+
+/**
+ * @brief Start a continuous tone (doesn't stop automatically)
+ *
+ * @param frequency_hz Frequency in Hz
+ * @return esp_err_t ESP_OK on success
+ */
+esp_err_t speaker_start_continuous(uint32_t frequency_hz);
+
 #endif // SPEAKER_H

@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
@@ -21,17 +22,24 @@ static const char *TAG = "BLUEBOX";
 // Flight recorder states
 typedef enum {
     STATE_INIT,
-    STATE_ARMED,
-    STATE_RECORDING,
-    STATE_COMPLETE,
-    STATE_WIFI_AP,
+    STATE_LAUNCH_MODE,
+    STATE_FLIGHT_MODE,
+    STATE_RECOVERY_MODE,
     STATE_ERROR
 } bluebox_state_t;
 
 static bluebox_state_t current_state = STATE_INIT;
 
-// Recording duration (milliseconds)
-#define RECORDING_DURATION_MS 20000  // 20 seconds max
+// Launch detection parameters
+#define LAUNCH_GYRO_THRESHOLD 150.0f      // deg/s - threshold for launch detection
+#define LAUNCH_DETECTION_DURATION_MS 250  // 250ms of sustained high acceleration
+
+// Landing detection parameters
+#define LANDING_GYRO_THRESHOLD 10.0f      // deg/s - threshold for stable/landed
+#define LANDING_STABLE_DURATION_MS 1000   // 1 second of stability to consider landed
+
+// Buffer management for launch mode (1 second of data)
+#define LAUNCH_MODE_BUFFER_DURATION_MS 1000
 
 // Sensor data structure
 typedef struct {
@@ -50,17 +58,20 @@ void sensor_task(void *pvParameters)
 {
     ESP_LOGI(TAG, "Sensor task started on core %d", xPortGetCoreID());
 
-    int64_t start_time = esp_timer_get_time();
     uint32_t sample_count = 0;
+    int64_t launch_mode_start = esp_timer_get_time();
+    int64_t last_buffer_reset = launch_mode_start;
 
-    while (current_state == STATE_RECORDING) {
+    // Launch detection
+    int64_t high_accel_start_time = 0;
+    bool in_high_accel = false;
+
+    // Landing detection
+    int64_t stable_start_time = 0;
+    bool is_stable = false;
+
+    while (current_state != STATE_RECOVERY_MODE && current_state != STATE_ERROR) {
         int64_t now = esp_timer_get_time();
-
-        // Check if recording duration exceeded
-        if ((now - start_time) > (RECORDING_DURATION_MS * 1000)) {
-            current_state = STATE_COMPLETE;
-            break;
-        }
 
         sensor_sample_t sample;
         sample.timestamp_us = now;
@@ -79,13 +90,67 @@ void sensor_task(void *pvParameters)
             circular_buffer_write(data_buffer, &sample, sizeof(sensor_sample_t));
             sample_count++;
 
-            // Debug output every 100 samples (~100ms at 1kHz)
-            if (sample_count % 100 == 0) {
-                ESP_LOGI(TAG, "Sample %lu: Gyro[%.1f,%.1f,%.1f] Accel[%.2f,%.2f,%.2f] P:%.1f T:%.1f",
-                         sample_count,
-                         sample.gyro_x, sample.gyro_y, sample.gyro_z,
-                         sample.accel_x, sample.accel_y, sample.accel_z,
-                         sample.pressure, sample.temperature);
+            // Calculate gyro magnitude for launch/landing detection
+            float gyro_magnitude = sqrtf(sample.gyro_x * sample.gyro_x +
+                                         sample.gyro_y * sample.gyro_y +
+                                         sample.gyro_z * sample.gyro_z);
+
+            // LAUNCH MODE: Monitor for launch
+            if (current_state == STATE_LAUNCH_MODE) {
+                // Reset buffer every 1 second to maintain 1-second window
+                if ((now - last_buffer_reset) > (LAUNCH_MODE_BUFFER_DURATION_MS * 1000)) {
+                    circular_buffer_reset(data_buffer);
+                    last_buffer_reset = now;
+                    sample_count = 0;
+                }
+
+                // Detect launch by sustained high gyro activity
+                if (gyro_magnitude > LAUNCH_GYRO_THRESHOLD) {
+                    if (!in_high_accel) {
+                        high_accel_start_time = now;
+                        in_high_accel = true;
+                    } else if ((now - high_accel_start_time) > (LAUNCH_DETECTION_DURATION_MS * 1000)) {
+                        ESP_LOGI(TAG, "LAUNCH DETECTED! Gyro magnitude: %.1f deg/s", gyro_magnitude);
+                        current_state = STATE_FLIGHT_MODE;
+                        speaker_stop();  // Stop launch mode beeps
+                        speaker_start_continuous(1500);  // Start flight mode continuous tone
+                    }
+                } else {
+                    in_high_accel = false;
+                }
+
+                // Debug output every 100 samples
+                if (sample_count % 100 == 0) {
+                    ESP_LOGI(TAG, "[LAUNCH] Sample %lu: Gyro[%.1f,%.1f,%.1f] Mag:%.1f",
+                             sample_count, sample.gyro_x, sample.gyro_y, sample.gyro_z, gyro_magnitude);
+                }
+            }
+            // FLIGHT MODE: Monitor for landing
+            else if (current_state == STATE_FLIGHT_MODE) {
+                // Check if gyro is stable (below threshold)
+                if (gyro_magnitude < LANDING_GYRO_THRESHOLD) {
+                    if (!is_stable) {
+                        stable_start_time = now;
+                        is_stable = true;
+                    } else if ((now - stable_start_time) > (LANDING_STABLE_DURATION_MS * 1000)) {
+                        ESP_LOGI(TAG, "LANDING DETECTED! Gyro stabilized at %.1f deg/s", gyro_magnitude);
+                        size_t buffer_used = circular_buffer_available(data_buffer);
+                        size_t samples_stored = buffer_used / sizeof(sensor_sample_t);
+                        ESP_LOGI(TAG, "Flight complete! Buffer: %zu bytes, %zu samples", buffer_used, samples_stored);
+                        current_state = STATE_RECOVERY_MODE;
+                        speaker_stop();  // Stop flight mode tone
+                        break;
+                    }
+                } else {
+                    is_stable = false;
+                }
+
+                // Debug output every 100 samples
+                if (sample_count % 100 == 0) {
+                    ESP_LOGI(TAG, "[FLIGHT] Sample %lu: Gyro[%.1f,%.1f,%.1f] Mag:%.1f Stable:%s",
+                             sample_count, sample.gyro_x, sample.gyro_y, sample.gyro_z,
+                             gyro_magnitude, is_stable ? "YES" : "NO");
+                }
             }
         }
 
@@ -93,7 +158,30 @@ void sensor_task(void *pvParameters)
         vTaskDelay(pdMS_TO_TICKS(1));
     }
 
-    ESP_LOGI(TAG, "Recording complete. Samples: %lu", sample_count);
+    ESP_LOGI(TAG, "Sensor task ending. Total samples: %lu", sample_count);
+    vTaskDelete(NULL);
+}
+
+// Task for periodic beeps in launch and recovery modes
+void beep_task(void *pvParameters)
+{
+    ESP_LOGI(TAG, "Beep task started on core %d", xPortGetCoreID());
+
+    while (current_state != STATE_ERROR) {
+        if (current_state == STATE_LAUNCH_MODE) {
+            speaker_two_tone_pair();
+            vTaskDelay(pdMS_TO_TICKS(3000));  // Wait 3 seconds
+        } else if (current_state == STATE_RECOVERY_MODE) {
+            speaker_triple_tone();
+            vTaskDelay(pdMS_TO_TICKS(6000));  // Wait 6 seconds
+        } else if (current_state == STATE_FLIGHT_MODE) {
+            // Flight mode uses continuous tone (started by sensor task)
+            vTaskDelay(pdMS_TO_TICKS(100));
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+    }
+
     vTaskDelete(NULL);
 }
 
@@ -258,9 +346,10 @@ void app_main(void)
 
     ESP_LOGI(TAG, "Circular buffer created: %zu bytes", buffer_size);
 
-    // Start recording immediately
-    current_state = STATE_RECORDING;
-    ESP_LOGI(TAG, "Starting recording...");
+    // Enter LAUNCH MODE
+    current_state = STATE_LAUNCH_MODE;
+    ESP_LOGI(TAG, "Entering LAUNCH MODE - waiting for launch...");
+    ESP_LOGI(TAG, "Launch threshold: %.1f deg/s", LAUNCH_GYRO_THRESHOLD);
 
     // Create sensor task on Core 0 for maximum performance
     xTaskCreatePinnedToCore(
@@ -273,32 +362,36 @@ void app_main(void)
         0  // Core 0
     );
 
-    // Main task monitors state on Core 1
-    while (current_state == STATE_RECORDING) {
+    // Create beep task on Core 1
+    xTaskCreatePinnedToCore(
+        beep_task,
+        "beep_task",
+        2048,
+        NULL,
+        tskIDLE_PRIORITY + 1,  // Low priority
+        NULL,
+        1  // Core 1
+    );
+
+    // Main task monitors state transitions on Core 1
+    while (current_state == STATE_LAUNCH_MODE || current_state == STATE_FLIGHT_MODE) {
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 
-    // Recording complete
-    if (current_state == STATE_COMPLETE) {
-        size_t buffer_used = circular_buffer_available(data_buffer);
-        size_t samples_stored = buffer_used / sizeof(sensor_sample_t);
-        ESP_LOGI(TAG, "Recording complete!");
-        ESP_LOGI(TAG, "Buffer: %zu bytes used, %zu samples stored", buffer_used, samples_stored);
-        speaker_beep(3, 200);  // Three beeps
-        vTaskDelay(pdMS_TO_TICKS(1000));
+    // Transition to RECOVERY MODE
+    if (current_state == STATE_RECOVERY_MODE) {
+        ESP_LOGI(TAG, "Entering RECOVERY MODE");
 
         // Start WiFi AP mode
-        current_state = STATE_WIFI_AP;
         wifi_init_ap();
 
         // Start HTTP server
         httpd_handle_t server = start_webserver();
 
         if (server != NULL) {
-            speaker_tone(1000, 500);  // Continuous tone for WiFi ready
             ESP_LOGI(TAG, "System ready. Connect to 'BlueBox' WiFi and access http://192.168.4.1/data");
 
-            // Keep running
+            // Keep running (beep task will continue triple-tone pattern)
             while (1) {
                 vTaskDelay(pdMS_TO_TICKS(1000));
             }
