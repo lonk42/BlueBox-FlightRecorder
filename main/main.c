@@ -11,11 +11,14 @@
 #include "esp_timer.h"
 #include "nvs_flash.h"
 #include "esp_http_server.h"
+#include "esp_heap_caps.h"
 
 #include "bmp280.h"
 #include "mpu6500.h"
+#include "flash_storage.h"
 #include "circular_buffer.h"
 #include "speaker.h"
+#include "neo6m.h"
 
 static const char *TAG = "BLUEBOX";
 
@@ -48,10 +51,18 @@ typedef struct {
     float accel_x, accel_y, accel_z;
     float pressure;
     float temperature;
+    // GPS data (sampled at 5Hz)
+    uint8_t gps_valid;          // 1 if GPS fix is valid, 0 otherwise
+    double gps_latitude;         // Latitude in degrees
+    double gps_longitude;        // Longitude in degrees
+    float gps_altitude;          // Altitude in meters
+    float gps_speed_kmh;         // Speed in km/h
+    float gps_heading;           // Heading in degrees
+    uint8_t gps_satellites;      // Number of satellites
 } sensor_sample_t;
 
-// Global circular buffer handle
-static circular_buffer_t *data_buffer = NULL;
+// Launch mode RAM buffer (holds 1 second of data before launch)
+static circular_buffer_t *launch_buffer = NULL;
 
 // Task to read MPU6500 at high speed (Core 0)
 void sensor_task(void *pvParameters)
@@ -59,8 +70,6 @@ void sensor_task(void *pvParameters)
     ESP_LOGI(TAG, "Sensor task started on core %d", xPortGetCoreID());
 
     uint32_t sample_count = 0;
-    int64_t launch_mode_start = esp_timer_get_time();
-    int64_t last_buffer_reset = launch_mode_start;
 
     // Launch detection
     int64_t high_accel_start_time = 0;
@@ -76,6 +85,15 @@ void sensor_task(void *pvParameters)
         sensor_sample_t sample;
         sample.timestamp_us = now;
 
+        // Initialize GPS fields to defaults
+        sample.gps_valid = 0;
+        sample.gps_latitude = 0.0;
+        sample.gps_longitude = 0.0;
+        sample.gps_altitude = 0.0f;
+        sample.gps_speed_kmh = 0.0f;
+        sample.gps_heading = 0.0f;
+        sample.gps_satellites = 0;
+
         // Read MPU6500 (gyro + accel) - fast SPI read
         if (mpu6500_read_gyro(&sample.gyro_x, &sample.gyro_y, &sample.gyro_z) == ESP_OK &&
             mpu6500_read_accel(&sample.accel_x, &sample.accel_y, &sample.accel_z) == ESP_OK) {
@@ -86,8 +104,28 @@ void sensor_task(void *pvParameters)
                 bmp280_read_temperature(&sample.temperature);
             }
 
-            // Write to circular buffer
-            circular_buffer_write(data_buffer, &sample, sizeof(sensor_sample_t));
+            // Read GPS every 200th sample (5Hz if MPU is 1kHz)
+            if (sample_count % 200 == 0) {
+                neo6m_data_t gps_data;
+                if (neo6m_get_data(&gps_data) == ESP_OK && gps_data.valid) {
+                    sample.gps_valid = 1;
+                    sample.gps_latitude = gps_data.latitude;
+                    sample.gps_longitude = gps_data.longitude;
+                    sample.gps_altitude = gps_data.altitude;
+                    sample.gps_speed_kmh = gps_data.speed_kmh;
+                    sample.gps_heading = gps_data.heading;
+                    sample.gps_satellites = gps_data.satellites;
+                }
+            }
+
+            // Write to appropriate storage based on state
+            if (current_state == STATE_LAUNCH_MODE) {
+                // In Launch Mode: write to RAM buffer only
+                circular_buffer_write(launch_buffer, &sample, sizeof(sensor_sample_t));
+            } else if (current_state == STATE_FLIGHT_MODE) {
+                // In Flight Mode: write directly to flash
+                flash_storage_write(&sample, sizeof(sensor_sample_t));
+            }
             sample_count++;
 
             // Calculate gyro magnitude for launch/landing detection
@@ -97,13 +135,6 @@ void sensor_task(void *pvParameters)
 
             // LAUNCH MODE: Monitor for launch
             if (current_state == STATE_LAUNCH_MODE) {
-                // Reset buffer every 1 second to maintain 1-second window
-                if ((now - last_buffer_reset) > (LAUNCH_MODE_BUFFER_DURATION_MS * 1000)) {
-                    circular_buffer_reset(data_buffer);
-                    last_buffer_reset = now;
-                    sample_count = 0;
-                }
-
                 // Detect launch by sustained high gyro activity
                 if (gyro_magnitude > LAUNCH_GYRO_THRESHOLD) {
                     if (!in_high_accel) {
@@ -111,6 +142,18 @@ void sensor_task(void *pvParameters)
                         in_high_accel = true;
                     } else if ((now - high_accel_start_time) > (LAUNCH_DETECTION_DURATION_MS * 1000)) {
                         ESP_LOGI(TAG, "LAUNCH DETECTED! Gyro magnitude: %.1f deg/s", gyro_magnitude);
+
+                        // Flush pre-launch RAM buffer to flash
+                        size_t prelaunch_bytes = circular_buffer_available(launch_buffer);
+                        size_t prelaunch_samples = prelaunch_bytes / sizeof(sensor_sample_t);
+                        ESP_LOGI(TAG, "Flushing %zu pre-launch samples from RAM to flash...", prelaunch_samples);
+
+                        sensor_sample_t temp_sample;
+                        while (circular_buffer_read(launch_buffer, &temp_sample, sizeof(sensor_sample_t)) > 0) {
+                            flash_storage_write(&temp_sample, sizeof(sensor_sample_t));
+                        }
+                        ESP_LOGI(TAG, "Pre-launch data written to flash");
+
                         current_state = STATE_FLIGHT_MODE;
                         speaker_stop();  // Stop launch mode beeps
                         speaker_start_continuous(1500);  // Start flight mode continuous tone
@@ -121,8 +164,16 @@ void sensor_task(void *pvParameters)
 
                 // Debug output every 100 samples
                 if (sample_count % 100 == 0) {
-                    ESP_LOGI(TAG, "[LAUNCH] Sample %lu: Gyro[%.1f,%.1f,%.1f] Mag:%.1f",
-                             sample_count, sample.gyro_x, sample.gyro_y, sample.gyro_z, gyro_magnitude);
+                    if (sample.gps_valid) {
+                        ESP_LOGI(TAG, "[LAUNCH] Sample %lu: Gyro[%.1f,%.1f,%.1f] Mag:%.1f P:%.1fkPa T:%.1fC GPS[%.6f,%.6f] Alt:%.1fm Sat:%d",
+                                 sample_count, sample.gyro_x, sample.gyro_y, sample.gyro_z, gyro_magnitude,
+                                 sample.pressure / 1000.0f, sample.temperature,
+                                 sample.gps_latitude, sample.gps_longitude, sample.gps_altitude, sample.gps_satellites);
+                    } else {
+                        ESP_LOGI(TAG, "[LAUNCH] Sample %lu: Gyro[%.1f,%.1f,%.1f] Mag:%.1f P:%.1fkPa T:%.1fC GPS:NO_FIX",
+                                 sample_count, sample.gyro_x, sample.gyro_y, sample.gyro_z, gyro_magnitude,
+                                 sample.pressure / 1000.0f, sample.temperature);
+                    }
                 }
             }
             // FLIGHT MODE: Monitor for landing
@@ -134,9 +185,13 @@ void sensor_task(void *pvParameters)
                         is_stable = true;
                     } else if ((now - stable_start_time) > (LANDING_STABLE_DURATION_MS * 1000)) {
                         ESP_LOGI(TAG, "LANDING DETECTED! Gyro stabilized at %.1f deg/s", gyro_magnitude);
-                        size_t buffer_used = circular_buffer_available(data_buffer);
-                        size_t samples_stored = buffer_used / sizeof(sensor_sample_t);
-                        ESP_LOGI(TAG, "Flight complete! Buffer: %zu bytes, %zu samples", buffer_used, samples_stored);
+
+                        // Flush any buffered data to flash
+                        flash_storage_flush();
+
+                        size_t bytes_written = flash_storage_get_bytes_written();
+                        size_t samples_stored = bytes_written / sizeof(sensor_sample_t);
+                        ESP_LOGI(TAG, "Flight complete! Flash: %zu bytes, %zu samples", bytes_written, samples_stored);
                         current_state = STATE_RECOVERY_MODE;
                         speaker_stop();  // Stop flight mode tone
                         break;
@@ -147,9 +202,18 @@ void sensor_task(void *pvParameters)
 
                 // Debug output every 100 samples
                 if (sample_count % 100 == 0) {
-                    ESP_LOGI(TAG, "[FLIGHT] Sample %lu: Gyro[%.1f,%.1f,%.1f] Mag:%.1f Stable:%s",
-                             sample_count, sample.gyro_x, sample.gyro_y, sample.gyro_z,
-                             gyro_magnitude, is_stable ? "YES" : "NO");
+                    if (sample.gps_valid) {
+                        ESP_LOGI(TAG, "[FLIGHT] Sample %lu: Gyro[%.1f,%.1f,%.1f] Mag:%.1f P:%.1fkPa T:%.1fC Stable:%s GPS[%.6f,%.6f] Spd:%.1fkm/h",
+                                 sample_count, sample.gyro_x, sample.gyro_y, sample.gyro_z,
+                                 gyro_magnitude, sample.pressure / 1000.0f, sample.temperature,
+                                 is_stable ? "YES" : "NO",
+                                 sample.gps_latitude, sample.gps_longitude, sample.gps_speed_kmh);
+                    } else {
+                        ESP_LOGI(TAG, "[FLIGHT] Sample %lu: Gyro[%.1f,%.1f,%.1f] Mag:%.1f P:%.1fkPa T:%.1fC Stable:%s GPS:NO_FIX",
+                                 sample_count, sample.gyro_x, sample.gyro_y, sample.gyro_z,
+                                 gyro_magnitude, sample.pressure / 1000.0f, sample.temperature,
+                                 is_stable ? "YES" : "NO");
+                    }
                 }
             }
         }
@@ -169,7 +233,14 @@ void beep_task(void *pvParameters)
 
     while (current_state != STATE_ERROR) {
         if (current_state == STATE_LAUNCH_MODE) {
-            speaker_two_tone_pair();
+            // Check GPS fix status and beep accordingly
+            if (neo6m_has_fix()) {
+                // GPS has fix: double beep (ready for flight)
+                speaker_beep(2, 150);
+            } else {
+                // GPS no fix: single beep (waiting for GPS)
+                speaker_beep(1, 150);
+            }
             vTaskDelay(pdMS_TO_TICKS(3000));  // Wait 3 seconds
         } else if (current_state == STATE_RECOVERY_MODE) {
             speaker_triple_tone();
@@ -185,16 +256,30 @@ void beep_task(void *pvParameters)
     vTaskDelete(NULL);
 }
 
-// Initialize WiFi Access Point
-void wifi_init_ap(void)
-{
-    ESP_LOGI(TAG, "Starting WiFi Access Point");
+// WiFi initialization task (runs on separate stack to avoid main task overflow)
+static volatile bool wifi_init_complete = false;
 
+void wifi_init_task(void *pvParameters)
+{
+    esp_err_t ret;
+
+    ESP_LOGI(TAG, "WiFi init task started on core %d", xPortGetCoreID());
+    ESP_LOGI(TAG, "WiFi init task stack: %u bytes", uxTaskGetStackHighWaterMark(NULL));
+
+    ESP_LOGI(TAG, "Creating default WiFi AP netif...");
     esp_netif_create_default_wifi_ap();
 
+    ESP_LOGI(TAG, "Initializing WiFi driver...");
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    ret = esp_wifi_init(&cfg);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "WiFi init failed: %s", esp_err_to_name(ret));
+        wifi_init_complete = true;
+        vTaskDelete(NULL);
+        return;
+    }
 
+    ESP_LOGI(TAG, "Configuring WiFi AP...");
     wifi_config_t wifi_config = {
         .ap = {
             .ssid = "BlueBox",
@@ -206,45 +291,116 @@ void wifi_init_ap(void)
         },
     };
 
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
-    ESP_ERROR_CHECK(esp_wifi_start());
+    ret = esp_wifi_set_mode(WIFI_MODE_AP);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "WiFi set mode failed: %s", esp_err_to_name(ret));
+        wifi_init_complete = true;
+        vTaskDelete(NULL);
+        return;
+    }
 
-    ESP_LOGI(TAG, "WiFi AP started. SSID: BlueBox, Password: bluebox123");
+    ret = esp_wifi_set_config(WIFI_IF_AP, &wifi_config);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "WiFi set config failed: %s", esp_err_to_name(ret));
+        wifi_init_complete = true;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ESP_LOGI(TAG, "Starting WiFi...");
+    ret = esp_wifi_start();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "WiFi start failed: %s", esp_err_to_name(ret));
+        wifi_init_complete = true;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ESP_LOGI(TAG, "WiFi AP started successfully. SSID: BlueBox, Password: bluebox123");
+    ESP_LOGI(TAG, "WiFi init task final stack watermark: %u bytes", uxTaskGetStackHighWaterMark(NULL));
+
+    wifi_init_complete = true;
+    vTaskDelete(NULL);
+}
+
+// HTTP handler for root path
+esp_err_t root_get_handler(httpd_req_t *req)
+{
+    ESP_LOGI(TAG, "Root endpoint accessed");
+    const char* resp_str = "<html><body><h1>BlueBox Flight Recorder</h1><p>Access flight data at <a href=\"/data\">/data</a></p></body></html>";
+    httpd_resp_send(req, resp_str, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
 }
 
 // HTTP handler to serve recorded data
 esp_err_t data_get_handler(httpd_req_t *req)
 {
-    ESP_LOGI(TAG, "Serving recorded data");
+    ESP_LOGI(TAG, "=== DATA ENDPOINT ACCESSED ===");
+    ESP_LOGI(TAG, "Client connected, preparing to serve flight data");
 
     // Send HTTP headers
     httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr_chunk(req, "{\"samples\":[");
+    httpd_resp_set_hdr(req, "Content-Disposition", "attachment; filename=\"bluebox-flight-data.json\"");
 
-    // Read all samples from circular buffer and send as JSON
-    size_t available = circular_buffer_available(data_buffer);
-    size_t sample_count = available / sizeof(sensor_sample_t);
+    ESP_LOGI(TAG, "Sending JSON header...");
+    esp_err_t ret = httpd_resp_sendstr_chunk(req, "{\"samples\":[");
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to send JSON header: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    // Read all samples from flash and send as JSON
+    size_t bytes_written = flash_storage_get_bytes_written();
+    size_t sample_count = bytes_written / sizeof(sensor_sample_t);
+
+    ESP_LOGI(TAG, "Flash contains %zu bytes, %zu samples", bytes_written, sample_count);
 
     sensor_sample_t sample;
-    char json_buf[256];
+    char json_buf[512];
+
+    ESP_LOGI(TAG, "Starting to send %zu samples...", sample_count);
 
     for (size_t i = 0; i < sample_count; i++) {
-        if (circular_buffer_read(data_buffer, &sample, sizeof(sensor_sample_t)) > 0) {
-            snprintf(json_buf, sizeof(json_buf),
-                     "%s{\"t\":%lld,\"gx\":%.2f,\"gy\":%.2f,\"gz\":%.2f,\"ax\":%.2f,\"ay\":%.2f,\"az\":%.2f,\"p\":%.2f,\"temp\":%.2f}",
-                     (i > 0) ? "," : "",
-                     sample.timestamp_us,
-                     sample.gyro_x, sample.gyro_y, sample.gyro_z,
-                     sample.accel_x, sample.accel_y, sample.accel_z,
-                     sample.pressure, sample.temperature);
-            httpd_resp_sendstr_chunk(req, json_buf);
+        // Log progress every 1000 samples
+        if (i > 0 && i % 1000 == 0) {
+            ESP_LOGI(TAG, "Sent %zu / %zu samples", i, sample_count);
+        }
+
+        size_t offset = i * sizeof(sensor_sample_t);
+        if (flash_storage_read(offset, &sample, sizeof(sensor_sample_t)) == ESP_OK) {
+            if (sample.gps_valid) {
+                snprintf(json_buf, sizeof(json_buf),
+                         "%s{\"t\":%lld,\"gx\":%.2f,\"gy\":%.2f,\"gz\":%.2f,\"ax\":%.2f,\"ay\":%.2f,\"az\":%.2f,\"p\":%.2f,\"temp\":%.2f,\"gps\":{\"lat\":%.7f,\"lon\":%.7f,\"alt\":%.1f,\"spd\":%.1f,\"hdg\":%.1f,\"sat\":%u}}",
+                         (i > 0) ? "," : "",
+                         sample.timestamp_us,
+                         sample.gyro_x, sample.gyro_y, sample.gyro_z,
+                         sample.accel_x, sample.accel_y, sample.accel_z,
+                         sample.pressure, sample.temperature,
+                         sample.gps_latitude, sample.gps_longitude, sample.gps_altitude,
+                         sample.gps_speed_kmh, sample.gps_heading, sample.gps_satellites);
+            } else {
+                snprintf(json_buf, sizeof(json_buf),
+                         "%s{\"t\":%lld,\"gx\":%.2f,\"gy\":%.2f,\"gz\":%.2f,\"ax\":%.2f,\"ay\":%.2f,\"az\":%.2f,\"p\":%.2f,\"temp\":%.2f}",
+                         (i > 0) ? "," : "",
+                         sample.timestamp_us,
+                         sample.gyro_x, sample.gyro_y, sample.gyro_z,
+                         sample.accel_x, sample.accel_y, sample.accel_z,
+                         sample.pressure, sample.temperature);
+            }
+
+            ret = httpd_resp_sendstr_chunk(req, json_buf);
+            if (ret != ESP_OK) {
+                ESP_LOGE(TAG, "Failed to send sample %zu: %s", i, esp_err_to_name(ret));
+                return ret;
+            }
         }
     }
 
+    ESP_LOGI(TAG, "Sending JSON footer...");
     httpd_resp_sendstr_chunk(req, "]}");
     httpd_resp_sendstr_chunk(req, NULL);
 
+    ESP_LOGI(TAG, "Data transfer complete - sent %zu samples", sample_count);
     return ESP_OK;
 }
 
@@ -254,16 +410,45 @@ httpd_handle_t start_webserver(void)
     httpd_handle_t server = NULL;
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.lru_purge_enable = true;
+    config.stack_size = 8192;  // Increase stack size for large data transfers
+    config.task_priority = tskIDLE_PRIORITY + 3;  // Higher priority
 
-    if (httpd_start(&server, &config) == ESP_OK) {
+    ESP_LOGI(TAG, "Starting HTTP server on port %d (stack: %d bytes)...",
+             config.server_port, config.stack_size);
+
+    esp_err_t ret = httpd_start(&server, &config);
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "HTTP server started successfully");
+
+        // Register root handler
+        httpd_uri_t root_uri = {
+            .uri       = "/",
+            .method    = HTTP_GET,
+            .handler   = root_get_handler,
+            .user_ctx  = NULL
+        };
+        ret = httpd_register_uri_handler(server, &root_uri);
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG, "Registered / endpoint");
+        } else {
+            ESP_LOGE(TAG, "Failed to register / endpoint: %s", esp_err_to_name(ret));
+        }
+
+        // Register data handler
         httpd_uri_t data_uri = {
             .uri       = "/data",
             .method    = HTTP_GET,
             .handler   = data_get_handler,
             .user_ctx  = NULL
         };
-        httpd_register_uri_handler(server, &data_uri);
-        ESP_LOGI(TAG, "HTTP server started");
+        ret = httpd_register_uri_handler(server, &data_uri);
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG, "Registered /data endpoint");
+        } else {
+            ESP_LOGE(TAG, "Failed to register /data endpoint: %s", esp_err_to_name(ret));
+        }
+    } else {
+        ESP_LOGE(TAG, "Failed to start HTTP server: %s", esp_err_to_name(ret));
     }
 
     return server;
@@ -310,8 +495,24 @@ void app_main(void)
         return;
     }
 
+    if (neo6m_init() != ESP_OK) {
+        ESP_LOGE(TAG, "NEO-6m GPS initialization failed");
+        current_state = STATE_ERROR;
+        speaker_beep_sos();
+        return;
+    }
+
+    // Start GPS task to begin acquiring fix
+    if (neo6m_start_task() != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start GPS task");
+        current_state = STATE_ERROR;
+        speaker_beep_sos();
+        return;
+    }
+
     speaker_beep(2, 200);  // Sensors initialized
     ESP_LOGI(TAG, "Sensors initialized successfully");
+    ESP_LOGI(TAG, "GPS acquiring fix...");
 
     // Test sensor readings
     float gx, gy, gz, ax, ay, az, pressure, temperature;
@@ -331,20 +532,38 @@ void app_main(void)
 
     vTaskDelay(pdMS_TO_TICKS(500));
 
-    // Create circular buffer (limited by internal RAM, no PSRAM on this board)
-    // At 1kHz: ~64KB / 48 bytes/sample = ~1365 samples = ~1.3 seconds of flight data
-    // Circular buffer will overwrite old data, keeping most recent samples
-    size_t buffer_size = 64 * 1024;  // 64KB buffer
-    data_buffer = circular_buffer_create(buffer_size);
-
-    if (data_buffer == NULL) {
-        ESP_LOGE(TAG, "Failed to create circular buffer");
+    // Initialize flash storage for flight data
+    // 2MB flash partition can hold ~23,250 samples = ~23 seconds at 1kHz
+    // Sample size: 8+24+8+30(GPS) = ~86 bytes (timestamp, IMU, BMP280, GPS)
+    if (flash_storage_init() != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize flash storage");
         current_state = STATE_ERROR;
         speaker_beep_sos();
         return;
     }
 
-    ESP_LOGI(TAG, "Circular buffer created: %zu bytes", buffer_size);
+    size_t flash_capacity = flash_storage_get_capacity();
+    size_t max_samples = flash_capacity / sizeof(sensor_sample_t);
+    float max_seconds = (float)max_samples / 1000.0f;  // Assuming 1kHz sampling
+
+    ESP_LOGI(TAG, "Flash storage initialized: %zu bytes capacity", flash_capacity);
+    ESP_LOGI(TAG, "Can store ~%zu samples (~%.1f seconds of flight data)", max_samples, max_seconds);
+
+    // Create RAM buffer for Launch Mode (1 second of data before launch)
+    // At 1kHz: 1000 samples × 86 bytes = ~86KB
+    size_t launch_buffer_size = 86 * 1024;  // 86KB buffer
+    launch_buffer = circular_buffer_create(launch_buffer_size);
+
+    if (launch_buffer == NULL) {
+        ESP_LOGE(TAG, "Failed to create launch mode RAM buffer");
+        current_state = STATE_ERROR;
+        speaker_beep_sos();
+        return;
+    }
+
+    size_t launch_samples = launch_buffer_size / sizeof(sensor_sample_t);
+    ESP_LOGI(TAG, "Launch mode RAM buffer created: %zu bytes (~%zu samples, ~%.1f seconds)",
+             launch_buffer_size, launch_samples, (float)launch_samples / 1000.0f);
 
     // Enter LAUNCH MODE
     current_state = STATE_LAUNCH_MODE;
@@ -382,8 +601,40 @@ void app_main(void)
     if (current_state == STATE_RECOVERY_MODE) {
         ESP_LOGI(TAG, "Entering RECOVERY MODE");
 
-        // Start WiFi AP mode
-        wifi_init_ap();
+        // Give tasks time to fully terminate and free resources
+        vTaskDelay(pdMS_TO_TICKS(500));
+
+        // Free launch mode RAM buffer to reclaim memory for WiFi
+        if (launch_buffer != NULL) {
+            ESP_LOGI(TAG, "Freeing launch mode RAM buffer...");
+            circular_buffer_destroy(launch_buffer);
+            launch_buffer = NULL;
+        }
+
+        // Log memory status before WiFi init
+        ESP_LOGI(TAG, "Free heap before WiFi: %lu bytes (largest block: %lu bytes)",
+                 (unsigned long)esp_get_free_heap_size(),
+                 (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+
+        // Start WiFi AP mode in separate task with large stack (10KB for PHY calibration)
+        ESP_LOGI(TAG, "Starting WiFi Access Point");
+        wifi_init_complete = false;
+        xTaskCreatePinnedToCore(
+            wifi_init_task,
+            "wifi_init",
+            10240,  // 10KB stack for WiFi init and PHY calibration
+            NULL,
+            tskIDLE_PRIORITY + 2,
+            NULL,
+            1  // Core 1
+        );
+
+        // Wait for WiFi initialization to complete
+        while (!wifi_init_complete) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+
+        ESP_LOGI(TAG, "Free heap after WiFi: %lu bytes", (unsigned long)esp_get_free_heap_size());
 
         // Start HTTP server
         httpd_handle_t server = start_webserver();
