@@ -1,5 +1,6 @@
 #include "speaker.h"
 #include "driver/ledc.h"
+#include "driver/gpio.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -45,7 +46,24 @@ esp_err_t speaker_init(void)
         return err;
     }
 
-    ESP_LOGI(TAG, "Speaker initialized on GPIO %d", SPEAKER_GPIO);
+    // Configure LED GPIO as output
+    gpio_config_t led_config = {
+        .pin_bit_mask = (1ULL << LED_GPIO),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    err = gpio_config(&led_config);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to configure LED GPIO: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    // Start with LED off
+    gpio_set_level(LED_GPIO, 0);
+
+    ESP_LOGI(TAG, "Speaker initialized on GPIO %d, LED on GPIO %d", SPEAKER_GPIO, LED_GPIO);
     return ESP_OK;
 }
 
@@ -58,9 +76,10 @@ esp_err_t speaker_tone(uint32_t frequency_hz, uint32_t duration_ms)
         return err;
     }
 
-    // Set duty cycle (50%)
+    // Set duty cycle (50%) and turn on LED
     ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, LEDC_DUTY);
     ledc_update_duty(LEDC_MODE, LEDC_CHANNEL);
+    gpio_set_level(LED_GPIO, 1);
 
     // Wait for duration
     if (duration_ms > 0) {
@@ -111,6 +130,7 @@ void speaker_stop(void)
 {
     ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, 0);
     ledc_update_duty(LEDC_MODE, LEDC_CHANNEL);
+    gpio_set_level(LED_GPIO, 0);
 }
 
 esp_err_t speaker_two_tone_pair(void)
@@ -143,9 +163,10 @@ esp_err_t speaker_start_continuous(uint32_t frequency_hz)
         return err;
     }
 
-    // Set duty cycle (50%) and keep playing
+    // Set duty cycle (50%) and keep playing, turn on LED
     ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, LEDC_DUTY);
     ledc_update_duty(LEDC_MODE, LEDC_CHANNEL);
+    gpio_set_level(LED_GPIO, 1);
 
     return ESP_OK;
 }

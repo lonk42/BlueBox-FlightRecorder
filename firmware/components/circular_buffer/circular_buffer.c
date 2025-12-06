@@ -57,9 +57,19 @@ size_t circular_buffer_write(circular_buffer_t *cb, const void *data, size_t len
     size_t space_available = cb->size - cb->count;
     if (len > space_available) {
         // Buffer full, overwrite oldest data
+        // IMPORTANT: Remove whole samples to maintain alignment
         size_t overflow = len - space_available;
-        cb->tail = (cb->tail + overflow) % cb->size;
-        cb->count -= overflow;
+        // Calculate how many complete samples to remove (round up)
+        size_t samples_to_remove = (overflow + len - 1) / len;
+        size_t bytes_to_remove = samples_to_remove * len;
+
+        // Ensure we don't remove more than available
+        if (bytes_to_remove > cb->count) {
+            bytes_to_remove = cb->count;
+        }
+
+        cb->tail = (cb->tail + bytes_to_remove) % cb->size;
+        cb->count -= bytes_to_remove;
     }
 
     // Write data

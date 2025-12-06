@@ -13,6 +13,7 @@
 #include "esp_http_server.h"
 #include "esp_http_client.h"
 #include "esp_heap_caps.h"
+#include "esp_crt_bundle.h"
 #include "cJSON.h"
 
 #include "bmp280.h"
@@ -34,6 +35,7 @@ typedef enum {
 } bluebox_state_t;
 
 static bluebox_state_t current_state = STATE_INIT;
+static volatile bool upload_in_progress = false;
 
 // Launch detection parameters
 #define LAUNCH_GYRO_THRESHOLD 150.0f      // deg/s - threshold for launch detection
@@ -72,6 +74,8 @@ void sensor_task(void *pvParameters)
     ESP_LOGI(TAG, "Sensor task started on core %d", xPortGetCoreID());
 
     uint32_t sample_count = 0;
+    int64_t boot_time = esp_timer_get_time();  // Reference time for flight duration
+    int64_t launch_time = 0;  // Time when launch was detected
 
     // Launch detection
     int64_t high_accel_start_time = 0;
@@ -143,18 +147,37 @@ void sensor_task(void *pvParameters)
                         high_accel_start_time = now;
                         in_high_accel = true;
                     } else if ((now - high_accel_start_time) > (LAUNCH_DETECTION_DURATION_MS * 1000)) {
+                        launch_time = now;  // Record launch time for flight duration tracking
                         ESP_LOGI(TAG, "LAUNCH DETECTED! Gyro magnitude: %.1f deg/s", gyro_magnitude);
 
                         // Flush pre-launch RAM buffer to flash
                         size_t prelaunch_bytes = circular_buffer_available(launch_buffer);
                         size_t prelaunch_samples = prelaunch_bytes / sizeof(sensor_sample_t);
-                        ESP_LOGI(TAG, "Flushing %zu pre-launch samples from RAM to flash...", prelaunch_samples);
+                        ESP_LOGI(TAG, "Pre-launch buffer: %zu bytes available, %zu samples (sample size=%zu)",
+                                 prelaunch_bytes, prelaunch_samples, sizeof(sensor_sample_t));
 
-                        sensor_sample_t temp_sample;
+                        // Track first and last timestamps for duration calculation
+                        sensor_sample_t first_sample, last_sample, temp_sample;
+                        bool first = true;
+                        size_t samples_written = 0;
+
                         while (circular_buffer_read(launch_buffer, &temp_sample, sizeof(sensor_sample_t)) > 0) {
+                            if (first) {
+                                first_sample = temp_sample;
+                                first = false;
+                            }
+                            last_sample = temp_sample;
                             flash_storage_write(&temp_sample, sizeof(sensor_sample_t));
+                            samples_written++;
                         }
-                        ESP_LOGI(TAG, "Pre-launch data written to flash");
+
+                        if (samples_written > 0) {
+                            float prelaunch_duration = (last_sample.timestamp_us - first_sample.timestamp_us) / 1000000.0f;
+                            ESP_LOGI(TAG, "Flushed %zu pre-launch samples (%.3f seconds of data) to flash",
+                                     samples_written, prelaunch_duration);
+                        } else {
+                            ESP_LOGW(TAG, "No pre-launch samples to flush!");
+                        }
 
                         current_state = STATE_FLIGHT_MODE;
                         speaker_stop();  // Stop launch mode beeps
@@ -166,14 +189,15 @@ void sensor_task(void *pvParameters)
 
                 // Debug output every 100 samples
                 if (sample_count % 100 == 0) {
+                    float time_sec = (now - boot_time) / 1000000.0f;
                     if (sample.gps_valid) {
-                        ESP_LOGI(TAG, "[LAUNCH] Sample %lu: Gyro[%.1f,%.1f,%.1f] Mag:%.1f P:%.1fkPa T:%.1fC GPS[%.6f,%.6f] Alt:%.1fm Sat:%d",
-                                 sample_count, sample.gyro_x, sample.gyro_y, sample.gyro_z, gyro_magnitude,
+                        ESP_LOGI(TAG, "[LAUNCH] T+%.3fs Sample %lu: Gyro[%.1f,%.1f,%.1f] Mag:%.1f P:%.1fkPa T:%.1fC GPS[%.6f,%.6f] Alt:%.1fm Sat:%d",
+                                 time_sec, sample_count, sample.gyro_x, sample.gyro_y, sample.gyro_z, gyro_magnitude,
                                  sample.pressure / 1000.0f, sample.temperature,
                                  sample.gps_latitude, sample.gps_longitude, sample.gps_altitude, sample.gps_satellites);
                     } else {
-                        ESP_LOGI(TAG, "[LAUNCH] Sample %lu: Gyro[%.1f,%.1f,%.1f] Mag:%.1f P:%.1fkPa T:%.1fC GPS:NO_FIX",
-                                 sample_count, sample.gyro_x, sample.gyro_y, sample.gyro_z, gyro_magnitude,
+                        ESP_LOGI(TAG, "[LAUNCH] T+%.3fs Sample %lu: Gyro[%.1f,%.1f,%.1f] Mag:%.1f P:%.1fkPa T:%.1fC GPS:NO_FIX",
+                                 time_sec, sample_count, sample.gyro_x, sample.gyro_y, sample.gyro_z, gyro_magnitude,
                                  sample.pressure / 1000.0f, sample.temperature);
                     }
                 }
@@ -204,15 +228,16 @@ void sensor_task(void *pvParameters)
 
                 // Debug output every 100 samples
                 if (sample_count % 100 == 0) {
+                    float flight_time_sec = (now - launch_time) / 1000000.0f;
                     if (sample.gps_valid) {
-                        ESP_LOGI(TAG, "[FLIGHT] Sample %lu: Gyro[%.1f,%.1f,%.1f] Mag:%.1f P:%.1fkPa T:%.1fC Stable:%s GPS[%.6f,%.6f] Spd:%.1fkm/h",
-                                 sample_count, sample.gyro_x, sample.gyro_y, sample.gyro_z,
+                        ESP_LOGI(TAG, "[FLIGHT] T+%.3fs Sample %lu: Gyro[%.1f,%.1f,%.1f] Mag:%.1f P:%.1fkPa T:%.1fC Stable:%s GPS[%.6f,%.6f] Spd:%.1fkm/h",
+                                 flight_time_sec, sample_count, sample.gyro_x, sample.gyro_y, sample.gyro_z,
                                  gyro_magnitude, sample.pressure / 1000.0f, sample.temperature,
                                  is_stable ? "YES" : "NO",
                                  sample.gps_latitude, sample.gps_longitude, sample.gps_speed_kmh);
                     } else {
-                        ESP_LOGI(TAG, "[FLIGHT] Sample %lu: Gyro[%.1f,%.1f,%.1f] Mag:%.1f P:%.1fkPa T:%.1fC Stable:%s GPS:NO_FIX",
-                                 sample_count, sample.gyro_x, sample.gyro_y, sample.gyro_z,
+                        ESP_LOGI(TAG, "[FLIGHT] T+%.3fs Sample %lu: Gyro[%.1f,%.1f,%.1f] Mag:%.1f P:%.1fkPa T:%.1fC Stable:%s GPS:NO_FIX",
+                                 flight_time_sec, sample_count, sample.gyro_x, sample.gyro_y, sample.gyro_z,
                                  gyro_magnitude, sample.pressure / 1000.0f, sample.temperature,
                                  is_stable ? "YES" : "NO");
                     }
@@ -245,8 +270,15 @@ void beep_task(void *pvParameters)
             }
             vTaskDelay(pdMS_TO_TICKS(3000));  // Wait 3 seconds
         } else if (current_state == STATE_RECOVERY_MODE) {
-            speaker_triple_tone();
-            vTaskDelay(pdMS_TO_TICKS(6000));  // Wait 6 seconds
+            if (upload_in_progress) {
+                // During upload: long beep every 2 seconds
+                speaker_tone(1000, 500);  // 500ms beep
+                vTaskDelay(pdMS_TO_TICKS(2000));  // Wait 2 seconds
+            } else {
+                // Not uploading (AP mode or upload complete): triple tone
+                speaker_triple_tone();
+                vTaskDelay(pdMS_TO_TICKS(6000));  // Wait 6 seconds
+            }
         } else if (current_state == STATE_FLIGHT_MODE) {
             // Flight mode uses continuous tone (started by sensor task)
             vTaskDelay(pdMS_TO_TICKS(100));
@@ -475,19 +507,20 @@ esp_err_t upload_flight_data_to_webapp(void)
 
     size_t bytes_written = flash_storage_get_bytes_written();
     size_t sample_count = bytes_written / sizeof(sensor_sample_t);
+    int status_code = 0;  // Declare at function start to avoid uninitialized error
 
     ESP_LOGI(TAG, "Preparing to upload %zu samples", sample_count);
-    ESP_LOGI(TAG, "Free heap: %lu bytes", (unsigned long)esp_get_free_heap_size());
+    ESP_LOGI(TAG, "Free heap before: %lu bytes", (unsigned long)esp_get_free_heap_size());
 
-    // Allocate buffer for JSON construction (8KB should be enough for chunks)
-    char *json_buffer = malloc(8192);
-    if (!json_buffer) {
-        ESP_LOGE(TAG, "Failed to allocate JSON buffer");
+    // Build JSON using cJSON library for proper formatting
+    cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        ESP_LOGE(TAG, "Failed to create JSON root object");
         return ESP_FAIL;
     }
 
-    // Build JSON header with device ID
-    int header_len = snprintf(json_buffer, 8192, "{\"device_id\":\"%s\",\"samples\":[",
+    // Add device ID
+    cJSON_AddStringToObject(root, "device_id",
     #ifdef CONFIG_BLUEBOX_DEVICE_ID
         CONFIG_BLUEBOX_DEVICE_ID
     #else
@@ -495,7 +528,30 @@ esp_err_t upload_flight_data_to_webapp(void)
     #endif
     );
 
-    ESP_LOGI(TAG, "JSON header size: %d bytes", header_len);
+    // Create samples array
+    cJSON *samples_array = cJSON_CreateArray();
+    if (!samples_array) {
+        ESP_LOGE(TAG, "Failed to create samples array");
+        cJSON_Delete(root);
+        return ESP_FAIL;
+    }
+    cJSON_AddItemToObject(root, "samples", samples_array);
+
+    // Upload at full 1kHz resolution
+    size_t decimation_factor = 1;
+    size_t upload_sample_count = sample_count / decimation_factor;
+
+    ESP_LOGI(TAG, "Uploading %zu samples at 1kHz (full resolution)",
+             upload_sample_count);
+
+    // We'll stream JSON manually using proper chunked encoding
+    // Allocate buffer for building JSON chunks
+    char *chunk_buffer = malloc(4096);
+    if (!chunk_buffer) {
+        ESP_LOGE(TAG, "Failed to allocate chunk buffer");
+        cJSON_Delete(root);
+        return ESP_FAIL;
+    }
 
     // Build URL
     char url[256];
@@ -505,66 +561,80 @@ esp_err_t upload_flight_data_to_webapp(void)
     // Check if URL is HTTPS
     bool is_https = (strncmp(url, "https://", 8) == 0);
 
-    // Configure HTTP client for chunked upload
+    // Configure HTTP client
     esp_http_client_config_t config = {
         .url = url,
         .method = HTTP_METHOD_POST,
-        .timeout_ms = 60000,  // 60 second timeout for large uploads
-        .buffer_size = 2048,
-        .buffer_size_tx = 2048,
+        .timeout_ms = 120000,  // 2 minute timeout for large uploads
+        .buffer_size = 4096,
+        .buffer_size_tx = 4096,
         .is_async = false,
     };
 
     // Enable SSL/TLS for HTTPS URLs
     if (is_https) {
         config.transport_type = HTTP_TRANSPORT_OVER_SSL;
-        config.skip_cert_common_name_check = true;
-        config.use_global_ca_store = true;  // Set to true to satisfy verification requirement
-        ESP_LOGI(TAG, "HTTPS detected - enabling SSL/TLS without cert verification");
+        config.crt_bundle_attach = esp_crt_bundle_attach;
+        ESP_LOGI(TAG, "HTTPS detected - enabling SSL/TLS with certificate bundle");
     }
 
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (!client) {
         ESP_LOGE(TAG, "Failed to initialize HTTP client");
-        free(json_buffer);
+        cJSON_Delete(root);
+        free(chunk_buffer);
         return ESP_FAIL;
     }
 
-    // Set headers
+    // Set headers for manual chunked encoding
     esp_http_client_set_header(client, "Content-Type", "application/json");
+    esp_http_client_set_header(client, "Transfer-Encoding", "chunked");
 
-    // Open connection
-    esp_err_t err = esp_http_client_open(client, -1);  // -1 = unknown content length (chunked)
+    // Open connection (don't specify content length)
+    esp_err_t err = esp_http_client_open(client, -1);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to open HTTP connection: %s", esp_err_to_name(err));
         esp_http_client_cleanup(client);
-        free(json_buffer);
+        cJSON_Delete(root);
+        free(chunk_buffer);
         return ESP_FAIL;
     }
 
-    // Write JSON header
-    int written = esp_http_client_write(client, json_buffer, header_len);
-    if (written < 0) {
-        ESP_LOGE(TAG, "Failed to write JSON header");
-        esp_http_client_close(client);
-        esp_http_client_cleanup(client);
-        free(json_buffer);
-        return ESP_FAIL;
-    }
+    ESP_LOGI(TAG, "Streaming JSON with manual chunked encoding...");
 
-    // Stream samples one at a time
+    // Small buffer for chunk size headers (separate from data buffer)
+    char chunk_header[32];
+
+    // Helper macro to write a chunk with proper HTTP/1.1 chunked encoding
+    #define WRITE_CHUNK(data, len) do { \
+        snprintf(chunk_header, sizeof(chunk_header), "%x\r\n", (unsigned int)(len)); \
+        if (esp_http_client_write(client, chunk_header, strlen(chunk_header)) < 0) goto upload_fail; \
+        if (esp_http_client_write(client, (data), (len)) < 0) goto upload_fail; \
+        if (esp_http_client_write(client, "\r\n", 2) < 0) goto upload_fail; \
+    } while(0)
+
+    // Write JSON header as first chunk
+    int header_len = snprintf(chunk_buffer, 4096, "{\"device_id\":\"%s\",\"samples\":[",
+    #ifdef CONFIG_BLUEBOX_DEVICE_ID
+        CONFIG_BLUEBOX_DEVICE_ID
+    #else
+        "bluebox-001"
+    #endif
+    );
+    WRITE_CHUNK(chunk_buffer, header_len);
+
+    // Stream samples
     sensor_sample_t sample;
-    for (size_t i = 0; i < sample_count; i++) {
-        if (i > 0 && i % 500 == 0) {
-            ESP_LOGI(TAG, "Uploaded %zu / %zu samples", i, sample_count);
+    for (size_t i = 0; i < sample_count; i += decimation_factor) {
+        if (i > 0 && i % 1000 == 0) {
+            ESP_LOGI(TAG, "Uploaded %zu / %zu samples", i / decimation_factor, upload_sample_count);
         }
 
         size_t offset = i * sizeof(sensor_sample_t);
         if (flash_storage_read(offset, &sample, sizeof(sensor_sample_t)) == ESP_OK) {
-            // Build JSON for this sample
             int sample_len;
             if (sample.gps_valid) {
-                sample_len = snprintf(json_buffer, 8192,
+                sample_len = snprintf(chunk_buffer, 4096,
                     "%s{\"t\":%lld,\"gx\":%.2f,\"gy\":%.2f,\"gz\":%.2f,\"ax\":%.2f,\"ay\":%.2f,\"az\":%.2f,\"p\":%.2f,\"temp\":%.2f,\"gps\":{\"lat\":%.7f,\"lon\":%.7f,\"alt\":%.1f,\"spd\":%.1f,\"hdg\":%.1f,\"sat\":%u}}",
                     (i > 0) ? "," : "",
                     sample.timestamp_us,
@@ -574,7 +644,7 @@ esp_err_t upload_flight_data_to_webapp(void)
                     sample.gps_latitude, sample.gps_longitude, sample.gps_altitude,
                     sample.gps_speed_kmh, sample.gps_heading, sample.gps_satellites);
             } else {
-                sample_len = snprintf(json_buffer, 8192,
+                sample_len = snprintf(chunk_buffer, 4096,
                     "%s{\"t\":%lld,\"gx\":%.2f,\"gy\":%.2f,\"gz\":%.2f,\"ax\":%.2f,\"ay\":%.2f,\"az\":%.2f,\"p\":%.2f,\"temp\":%.2f}",
                     (i > 0) ? "," : "",
                     sample.timestamp_us,
@@ -582,70 +652,81 @@ esp_err_t upload_flight_data_to_webapp(void)
                     sample.accel_x, sample.accel_y, sample.accel_z,
                     sample.pressure, sample.temperature);
             }
-
-            // Write this sample
-            written = esp_http_client_write(client, json_buffer, sample_len);
-            if (written < 0) {
-                ESP_LOGE(TAG, "Failed to write sample %zu", i);
-                esp_http_client_close(client);
-                esp_http_client_cleanup(client);
-                free(json_buffer);
-                return ESP_FAIL;
-            }
+            WRITE_CHUNK(chunk_buffer, sample_len);
         }
     }
 
     // Write JSON footer
     const char *footer = "]}";
-    written = esp_http_client_write(client, footer, strlen(footer));
-    if (written < 0) {
-        ESP_LOGE(TAG, "Failed to write JSON footer");
-        esp_http_client_close(client);
-        esp_http_client_cleanup(client);
-        free(json_buffer);
-        return ESP_FAIL;
-    }
+    WRITE_CHUNK(footer, strlen(footer));
 
-    ESP_LOGI(TAG, "All data written, fetching response...");
+    // Write terminating chunk (0-length)
+    if (esp_http_client_write(client, "0\r\n\r\n", 5) < 0) goto upload_fail;
+
+    ESP_LOGI(TAG, "All chunks sent, fetching response...");
 
     // Fetch response
     int content_length = esp_http_client_fetch_headers(client);
-    int status_code = esp_http_client_get_status_code(client);
+    status_code = esp_http_client_get_status_code(client);
 
     ESP_LOGI(TAG, "HTTP POST Status = %d, content_length = %d", status_code, content_length);
 
-    // Close connection
+    // Read response body
+    if (content_length > 0 && content_length < 2048) {
+        int read_len = esp_http_client_read(client, chunk_buffer, content_length);
+        if (read_len > 0) {
+            chunk_buffer[read_len] = '\0';
+            ESP_LOGI(TAG, "Response body: %s", chunk_buffer);
+        }
+    }
+
+    // Cleanup
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
-    free(json_buffer);
+    cJSON_Delete(root);
+    free(chunk_buffer);
 
     if (status_code == 200 || status_code == 201) {
-        ESP_LOGI(TAG, "✓ Flight data uploaded successfully!");
-
-        #ifdef CONFIG_BLUEBOX_AUDIO_FEEDBACK
-        // Success tone: three ascending beeps
-        speaker_tone(800, 200);
-        vTaskDelay(pdMS_TO_TICKS(250));
-        speaker_tone(1000, 200);
-        vTaskDelay(pdMS_TO_TICKS(250));
-        speaker_tone(1200, 200);
-        #endif
-
-        return ESP_OK;
+        goto upload_success;
     } else {
-        ESP_LOGE(TAG, "Upload failed with status code: %d", status_code);
-
-        #ifdef CONFIG_BLUEBOX_AUDIO_FEEDBACK
-        // Failure tone: descending beeps
-        speaker_tone(1200, 200);
-        vTaskDelay(pdMS_TO_TICKS(250));
-        speaker_tone(800, 200);
-        vTaskDelay(pdMS_TO_TICKS(250));
-        speaker_tone(400, 200);
-        #endif
-
-        return ESP_FAIL;
+        goto upload_failed;
     }
+
+upload_fail:
+    ESP_LOGE(TAG, "Failed to write chunk");
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+    cJSON_Delete(root);
+    free(chunk_buffer);
+    goto upload_failed;
+
+upload_success:
+    ESP_LOGI(TAG, "✓ Flight data uploaded successfully!");
+
+    #ifdef CONFIG_BLUEBOX_AUDIO_FEEDBACK
+    // Success tone: three ascending beeps
+    speaker_tone(800, 200);
+    vTaskDelay(pdMS_TO_TICKS(250));
+    speaker_tone(1000, 200);
+    vTaskDelay(pdMS_TO_TICKS(250));
+    speaker_tone(1200, 200);
+    #endif
+
+    return ESP_OK;
+
+upload_failed:
+    ESP_LOGE(TAG, "Upload failed with status code: %d", status_code);
+
+    #ifdef CONFIG_BLUEBOX_AUDIO_FEEDBACK
+    // Failure tone: descending beeps
+    speaker_tone(1200, 200);
+    vTaskDelay(pdMS_TO_TICKS(250));
+    speaker_tone(800, 200);
+    vTaskDelay(pdMS_TO_TICKS(250));
+    speaker_tone(400, 200);
+    #endif
+
+    return ESP_FAIL;
 }
 
 // Task to continuously attempt upload in Station Mode
@@ -661,15 +742,18 @@ void upload_task(void *pvParameters)
     ESP_LOGI(TAG, "WiFi connected. Starting upload attempts...");
 
     while (1) {
+        upload_in_progress = true;
         esp_err_t result = upload_flight_data_to_webapp();
 
         if (result == ESP_OK) {
             ESP_LOGI(TAG, "Upload successful! Task complete.");
+            upload_in_progress = false;
             // Successfully uploaded, we can stop trying
             vTaskDelete(NULL);
             return;
         }
 
+        upload_in_progress = false;
         // Wait before retry
         ESP_LOGI(TAG, "Upload failed. Retrying in %d seconds...", CONFIG_BLUEBOX_UPLOAD_RETRY_INTERVAL_SEC);
         vTaskDelay(pdMS_TO_TICKS(CONFIG_BLUEBOX_UPLOAD_RETRY_INTERVAL_SEC * 1000));
@@ -915,8 +999,10 @@ void app_main(void)
     }
 
     size_t launch_samples = launch_buffer_size / sizeof(sensor_sample_t);
-    ESP_LOGI(TAG, "Launch mode RAM buffer created: %zu bytes (~%zu samples, ~%.1f seconds)",
-             launch_buffer_size, launch_samples, (float)launch_samples / 1000.0f);
+    ESP_LOGI(TAG, "Launch mode RAM buffer created: %zu bytes", launch_buffer_size);
+    ESP_LOGI(TAG, "  Sample size: %zu bytes", sizeof(sensor_sample_t));
+    ESP_LOGI(TAG, "  Capacity: ~%zu samples (~%.1f seconds at 1kHz)",
+             launch_samples, (float)launch_samples / 1000.0f);
 
     // Enter LAUNCH MODE
     current_state = STATE_LAUNCH_MODE;

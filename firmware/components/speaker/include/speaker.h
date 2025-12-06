@@ -4,6 +4,7 @@
 #include "esp_err.h"
 
 #define SPEAKER_GPIO 25
+#define LED_GPIO 2
 
 /**
  * @brief Initialize the speaker

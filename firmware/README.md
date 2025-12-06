@@ -33,9 +33,10 @@ ESP32-based flight data recorder for high-speed projectiles.
 - VCC → 3.3V or 5V (depending on module)
 - GND → GND
 
-### Speaker
+### Speaker & LED
 - Speaker+ → GPIO 25
 - Speaker- → GND
+- LED (built-in on many ESP32 boards) → GPIO 2 (mimics speaker)
 
 ## Building and Flashing
 
@@ -98,12 +99,19 @@ BlueBox automatically transitions through three modes based on detected motion:
 - **Transition**: Automatically enters Recovery Mode when landing detected (gyro <10 deg/s for 1 second)
 
 ### 3. Recovery Mode (Post-Flight)
-- **Audio**: Triple ascending tone every 6 seconds
-- **Behavior**: WiFi AP activates, data available for download
-- **WiFi Access**:
-  - SSID: `BlueBox`
-  - Password: `bluebox123`
-  - Data endpoint: `http://192.168.4.1/data`
+- **Audio**:
+  - **Station Mode (uploading)**: Long beep (500ms) every 2 seconds + LED blinks
+  - **AP Mode or waiting**: Triple ascending tone (800→1000→1200 Hz) every 6 seconds + LED blinks with pattern
+- **Behavior**: WiFi activates for data upload or retrieval
+- **Two Recovery Modes** (configured via menuconfig):
+  - **AP Mode** (default): Creates WiFi access point
+    - SSID: `BlueBox`
+    - Password: `bluebox123`
+    - Data endpoint: `http://192.168.4.1/data`
+  - **Station Mode**: Connects to WiFi network, automatically uploads to webapp
+    - Configure via `idf.py menuconfig` → BlueBox Configuration
+    - Set WiFi credentials and webapp URL
+    - Retries upload until successful
 
 ### Startup Sequence
 1. **Power On**: Single beep
@@ -142,10 +150,13 @@ BlueBox automatically transitions through three modes based on detected motion:
 
 ## Audio Feedback
 
-- **Single beep**: Power on
-- **Two beeps**: Sensors ready, entering Launch Mode
-- **Single beep every 3s**: Launch Mode - waiting for GPS fix
-- **Double beep every 3s**: Launch Mode - GPS fix acquired (ready for flight!)
-- **Continuous tone (1500Hz)**: Flight Mode active
-- **Triple ascending tone every 6s**: Recovery Mode active (WiFi ready)
-- **SOS pattern**: Error state
+The onboard speaker and LED (GPIO 2) provide synchronized audio and visual status feedback:
+
+- **Single beep + LED flash**: Power on
+- **Two beeps + LED flashes**: Sensors ready, entering Launch Mode
+- **Single beep every 3s + LED flash**: Launch Mode - waiting for GPS fix
+- **Double beep every 3s + LED flashes**: Launch Mode - GPS fix acquired (ready for flight!)
+- **Continuous tone (1500Hz) + LED on**: Flight Mode active (recording)
+- **Long beep (500ms) every 2s + LED flash**: Station Mode - actively uploading data
+- **Triple ascending tone (800→1000→1200 Hz) every 6s + LED flashes**: Recovery Mode - AP active or waiting between upload retries
+- **SOS pattern + LED flashes**: Error state

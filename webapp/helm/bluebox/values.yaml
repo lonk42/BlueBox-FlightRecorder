@@ -119,9 +119,15 @@ frontend:
 ingress:
   enabled: true
   className: "nginx"  # Change based on your ingress controller
-  annotations: {}
+  annotations:
+    # Allow large request bodies for flight data uploads (ESP32 sends ~1MB JSON)
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+    # Disable request buffering to allow chunked encoding from ESP32
+    nginx.ingress.kubernetes.io/proxy-request-buffering: "off"
+    # Increase timeouts for slow ESP32 WiFi connections
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
     # cert-manager.io/cluster-issuer: "letsencrypt-prod"
-    # nginx.ingress.kubernetes.io/rewrite-target: /
 
   host: bluebox.example.com  # Change to your domain
 
