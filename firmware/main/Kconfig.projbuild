@@ -1,0 +1,72 @@
+menu "BlueBox Configuration"
+
+    choice BLUEBOX_RECOVERY_MODE
+        prompt "Recovery Mode Type"
+        default BLUEBOX_RECOVERY_MODE_AP
+        help
+            Select the recovery mode behavior after landing detection.
+
+            AP Mode: Creates a WiFi access point "BlueBox" for manual data retrieval
+            Station Mode: Connects to configured WiFi network and uploads data automatically
+
+        config BLUEBOX_RECOVERY_MODE_AP
+            bool "AP Mode (Access Point)"
+            help
+                Device creates its own WiFi network for manual data download
+
+        config BLUEBOX_RECOVERY_MODE_STATION
+            bool "Station Mode (Connect to WiFi)"
+            help
+                Device connects to configured WiFi network and uploads data to webapp
+    endchoice
+
+    menu "Station Mode Configuration"
+        visible if BLUEBOX_RECOVERY_MODE_STATION
+
+        config BLUEBOX_WIFI_SSID
+            string "WiFi SSID"
+            default "YourWiFiNetwork"
+            help
+                Name of the WiFi network to connect to
+
+        config BLUEBOX_WIFI_PASSWORD
+            string "WiFi Password"
+            default "YourWiFiPassword"
+            help
+                Password for the WiFi network
+
+        config BLUEBOX_WEBAPP_URL
+            string "Webapp API URL"
+            default "http://192.168.1.100:8049"
+            help
+                URL of the BlueBox webapp API endpoint (without /api/flights)
+                Example: http://192.168.1.100:8049 or http://bluebox.local:8049
+
+        config BLUEBOX_DEVICE_ID
+            string "Device ID"
+            default "bluebox-001"
+            help
+                Unique identifier for this BlueBox device
+
+        config BLUEBOX_WIFI_RETRY_INTERVAL_SEC
+            int "WiFi Connection Retry Interval (seconds)"
+            default 10
+            range 5 60
+            help
+                Time to wait between WiFi connection attempts
+
+        config BLUEBOX_UPLOAD_RETRY_INTERVAL_SEC
+            int "Upload Retry Interval (seconds)"
+            default 30
+            range 10 120
+            help
+                Time to wait between upload attempts after WiFi is connected
+    endmenu
+
+    config BLUEBOX_AUDIO_FEEDBACK
+        bool "Enable Audio Feedback"
+        default y
+        help
+            Enable audio tones for status indication during recovery mode
+
+endmenu

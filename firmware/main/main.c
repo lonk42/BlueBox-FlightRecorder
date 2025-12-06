@@ -11,7 +11,9 @@
 #include "esp_timer.h"
 #include "nvs_flash.h"
 #include "esp_http_server.h"
+#include "esp_http_client.h"
 #include "esp_heap_caps.h"
+#include "cJSON.h"
 
 #include "bmp280.h"
 #include "mpu6500.h"
@@ -256,14 +258,52 @@ void beep_task(void *pvParameters)
     vTaskDelete(NULL);
 }
 
+// WiFi event handler for Station Mode
+static EventGroupHandle_t wifi_event_group = NULL;
+static const int WIFI_CONNECTED_BIT = BIT0;
+static int wifi_retry_count = 0;
+
+static void wifi_event_handler(void* arg, esp_event_base_t event_base,
+                                int32_t event_id, void* event_data)
+{
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        ESP_LOGI(TAG, "WiFi Station started, attempting connection...");
+        esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        wifi_retry_count++;
+        ESP_LOGI(TAG, "Disconnected from AP, retry attempt %d...", wifi_retry_count);
+
+        #ifdef CONFIG_BLUEBOX_AUDIO_FEEDBACK
+        // Single low beep for disconnect
+        speaker_tone(500, 200);
+        #endif
+
+        // Wait before retry based on config
+        vTaskDelay(pdMS_TO_TICKS(CONFIG_BLUEBOX_WIFI_RETRY_INTERVAL_SEC * 1000));
+        esp_wifi_connect();
+        xEventGroupClearBits(wifi_event_group, WIFI_CONNECTED_BIT);
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
+        ESP_LOGI(TAG, "Connected! Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        wifi_retry_count = 0;
+        xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
+
+        #ifdef CONFIG_BLUEBOX_AUDIO_FEEDBACK
+        // Double beep for successful connection
+        speaker_beep(2, 200);
+        #endif
+    }
+}
+
 // WiFi initialization task (runs on separate stack to avoid main task overflow)
 static volatile bool wifi_init_complete = false;
+static volatile bool wifi_connected = false;
 
-void wifi_init_task(void *pvParameters)
+void wifi_init_ap_task(void *pvParameters)
 {
     esp_err_t ret;
 
-    ESP_LOGI(TAG, "WiFi init task started on core %d", xPortGetCoreID());
+    ESP_LOGI(TAG, "WiFi AP Mode init task started on core %d", xPortGetCoreID());
     ESP_LOGI(TAG, "WiFi init task stack: %u bytes", uxTaskGetStackHighWaterMark(NULL));
 
     ESP_LOGI(TAG, "Creating default WiFi AP netif...");
@@ -320,7 +360,320 @@ void wifi_init_task(void *pvParameters)
     ESP_LOGI(TAG, "WiFi init task final stack watermark: %u bytes", uxTaskGetStackHighWaterMark(NULL));
 
     wifi_init_complete = true;
+    wifi_connected = true;  // AP mode is always "connected"
     vTaskDelete(NULL);
+}
+
+void wifi_init_station_task(void *pvParameters)
+{
+    esp_err_t ret;
+
+    ESP_LOGI(TAG, "WiFi Station Mode init task started on core %d", xPortGetCoreID());
+    ESP_LOGI(TAG, "WiFi init task stack: %u bytes", uxTaskGetStackHighWaterMark(NULL));
+
+    // Create event group for connection status
+    wifi_event_group = xEventGroupCreate();
+
+    ESP_LOGI(TAG, "Creating default WiFi STA netif...");
+    esp_netif_create_default_wifi_sta();
+
+    ESP_LOGI(TAG, "Initializing WiFi driver...");
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ret = esp_wifi_init(&cfg);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "WiFi init failed: %s", esp_err_to_name(ret));
+        wifi_init_complete = true;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    // Register event handlers
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
+                                                        ESP_EVENT_ANY_ID,
+                                                        &wifi_event_handler,
+                                                        NULL,
+                                                        NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
+                                                        IP_EVENT_STA_GOT_IP,
+                                                        &wifi_event_handler,
+                                                        NULL,
+                                                        NULL));
+
+    ESP_LOGI(TAG, "Configuring WiFi Station Mode...");
+    wifi_config_t wifi_config = {
+        .sta = {
+            .ssid = CONFIG_BLUEBOX_WIFI_SSID,
+            .password = CONFIG_BLUEBOX_WIFI_PASSWORD,
+            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+            .sae_pwe_h2e = WPA3_SAE_PWE_BOTH,
+        },
+    };
+
+    ESP_LOGI(TAG, "Connecting to SSID: %s", CONFIG_BLUEBOX_WIFI_SSID);
+
+    ret = esp_wifi_set_mode(WIFI_MODE_STA);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "WiFi set mode failed: %s", esp_err_to_name(ret));
+        wifi_init_complete = true;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ret = esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "WiFi set config failed: %s", esp_err_to_name(ret));
+        wifi_init_complete = true;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ESP_LOGI(TAG, "Starting WiFi...");
+    ret = esp_wifi_start();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "WiFi start failed: %s", esp_err_to_name(ret));
+        wifi_init_complete = true;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ESP_LOGI(TAG, "WiFi Station Mode started. Waiting for connection...");
+    wifi_init_complete = true;
+
+    // Wait for connection indefinitely
+    ESP_LOGI(TAG, "Waiting for WiFi connection to %s...", CONFIG_BLUEBOX_WIFI_SSID);
+    EventBits_t bits = xEventGroupWaitBits(wifi_event_group,
+                                           WIFI_CONNECTED_BIT,
+                                           pdFALSE,
+                                           pdFALSE,
+                                           portMAX_DELAY);
+
+    if (bits & WIFI_CONNECTED_BIT) {
+        ESP_LOGI(TAG, "WiFi connected successfully!");
+        wifi_connected = true;
+    }
+
+    ESP_LOGI(TAG, "WiFi init task final stack watermark: %u bytes", uxTaskGetStackHighWaterMark(NULL));
+    vTaskDelete(NULL);
+}
+
+// HTTP write callback for chunked upload
+typedef struct {
+    size_t sample_count;
+    size_t current_index;
+    bool first_sample;
+} upload_context_t;
+
+static int http_upload_chunk_cb(esp_http_client_event_t *evt)
+{
+    return ESP_OK;
+}
+
+// HTTP POST to upload flight data to webapp
+esp_err_t upload_flight_data_to_webapp(void)
+{
+    ESP_LOGI(TAG, "=== UPLOADING FLIGHT DATA TO WEBAPP ===");
+
+    size_t bytes_written = flash_storage_get_bytes_written();
+    size_t sample_count = bytes_written / sizeof(sensor_sample_t);
+
+    ESP_LOGI(TAG, "Preparing to upload %zu samples", sample_count);
+    ESP_LOGI(TAG, "Free heap: %lu bytes", (unsigned long)esp_get_free_heap_size());
+
+    // Allocate buffer for JSON construction (8KB should be enough for chunks)
+    char *json_buffer = malloc(8192);
+    if (!json_buffer) {
+        ESP_LOGE(TAG, "Failed to allocate JSON buffer");
+        return ESP_FAIL;
+    }
+
+    // Build JSON header with device ID
+    int header_len = snprintf(json_buffer, 8192, "{\"device_id\":\"%s\",\"samples\":[",
+    #ifdef CONFIG_BLUEBOX_DEVICE_ID
+        CONFIG_BLUEBOX_DEVICE_ID
+    #else
+        "bluebox-001"
+    #endif
+    );
+
+    ESP_LOGI(TAG, "JSON header size: %d bytes", header_len);
+
+    // Build URL
+    char url[256];
+    snprintf(url, sizeof(url), "%s/api/flights", CONFIG_BLUEBOX_WEBAPP_URL);
+    ESP_LOGI(TAG, "Uploading to: %s", url);
+
+    // Check if URL is HTTPS
+    bool is_https = (strncmp(url, "https://", 8) == 0);
+
+    // Configure HTTP client for chunked upload
+    esp_http_client_config_t config = {
+        .url = url,
+        .method = HTTP_METHOD_POST,
+        .timeout_ms = 60000,  // 60 second timeout for large uploads
+        .buffer_size = 2048,
+        .buffer_size_tx = 2048,
+        .is_async = false,
+    };
+
+    // Enable SSL/TLS for HTTPS URLs
+    if (is_https) {
+        config.transport_type = HTTP_TRANSPORT_OVER_SSL;
+        config.skip_cert_common_name_check = true;
+        config.use_global_ca_store = true;  // Set to true to satisfy verification requirement
+        ESP_LOGI(TAG, "HTTPS detected - enabling SSL/TLS without cert verification");
+    }
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (!client) {
+        ESP_LOGE(TAG, "Failed to initialize HTTP client");
+        free(json_buffer);
+        return ESP_FAIL;
+    }
+
+    // Set headers
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+
+    // Open connection
+    esp_err_t err = esp_http_client_open(client, -1);  // -1 = unknown content length (chunked)
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to open HTTP connection: %s", esp_err_to_name(err));
+        esp_http_client_cleanup(client);
+        free(json_buffer);
+        return ESP_FAIL;
+    }
+
+    // Write JSON header
+    int written = esp_http_client_write(client, json_buffer, header_len);
+    if (written < 0) {
+        ESP_LOGE(TAG, "Failed to write JSON header");
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        free(json_buffer);
+        return ESP_FAIL;
+    }
+
+    // Stream samples one at a time
+    sensor_sample_t sample;
+    for (size_t i = 0; i < sample_count; i++) {
+        if (i > 0 && i % 500 == 0) {
+            ESP_LOGI(TAG, "Uploaded %zu / %zu samples", i, sample_count);
+        }
+
+        size_t offset = i * sizeof(sensor_sample_t);
+        if (flash_storage_read(offset, &sample, sizeof(sensor_sample_t)) == ESP_OK) {
+            // Build JSON for this sample
+            int sample_len;
+            if (sample.gps_valid) {
+                sample_len = snprintf(json_buffer, 8192,
+                    "%s{\"t\":%lld,\"gx\":%.2f,\"gy\":%.2f,\"gz\":%.2f,\"ax\":%.2f,\"ay\":%.2f,\"az\":%.2f,\"p\":%.2f,\"temp\":%.2f,\"gps\":{\"lat\":%.7f,\"lon\":%.7f,\"alt\":%.1f,\"spd\":%.1f,\"hdg\":%.1f,\"sat\":%u}}",
+                    (i > 0) ? "," : "",
+                    sample.timestamp_us,
+                    sample.gyro_x, sample.gyro_y, sample.gyro_z,
+                    sample.accel_x, sample.accel_y, sample.accel_z,
+                    sample.pressure, sample.temperature,
+                    sample.gps_latitude, sample.gps_longitude, sample.gps_altitude,
+                    sample.gps_speed_kmh, sample.gps_heading, sample.gps_satellites);
+            } else {
+                sample_len = snprintf(json_buffer, 8192,
+                    "%s{\"t\":%lld,\"gx\":%.2f,\"gy\":%.2f,\"gz\":%.2f,\"ax\":%.2f,\"ay\":%.2f,\"az\":%.2f,\"p\":%.2f,\"temp\":%.2f}",
+                    (i > 0) ? "," : "",
+                    sample.timestamp_us,
+                    sample.gyro_x, sample.gyro_y, sample.gyro_z,
+                    sample.accel_x, sample.accel_y, sample.accel_z,
+                    sample.pressure, sample.temperature);
+            }
+
+            // Write this sample
+            written = esp_http_client_write(client, json_buffer, sample_len);
+            if (written < 0) {
+                ESP_LOGE(TAG, "Failed to write sample %zu", i);
+                esp_http_client_close(client);
+                esp_http_client_cleanup(client);
+                free(json_buffer);
+                return ESP_FAIL;
+            }
+        }
+    }
+
+    // Write JSON footer
+    const char *footer = "]}";
+    written = esp_http_client_write(client, footer, strlen(footer));
+    if (written < 0) {
+        ESP_LOGE(TAG, "Failed to write JSON footer");
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        free(json_buffer);
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "All data written, fetching response...");
+
+    // Fetch response
+    int content_length = esp_http_client_fetch_headers(client);
+    int status_code = esp_http_client_get_status_code(client);
+
+    ESP_LOGI(TAG, "HTTP POST Status = %d, content_length = %d", status_code, content_length);
+
+    // Close connection
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+    free(json_buffer);
+
+    if (status_code == 200 || status_code == 201) {
+        ESP_LOGI(TAG, "✓ Flight data uploaded successfully!");
+
+        #ifdef CONFIG_BLUEBOX_AUDIO_FEEDBACK
+        // Success tone: three ascending beeps
+        speaker_tone(800, 200);
+        vTaskDelay(pdMS_TO_TICKS(250));
+        speaker_tone(1000, 200);
+        vTaskDelay(pdMS_TO_TICKS(250));
+        speaker_tone(1200, 200);
+        #endif
+
+        return ESP_OK;
+    } else {
+        ESP_LOGE(TAG, "Upload failed with status code: %d", status_code);
+
+        #ifdef CONFIG_BLUEBOX_AUDIO_FEEDBACK
+        // Failure tone: descending beeps
+        speaker_tone(1200, 200);
+        vTaskDelay(pdMS_TO_TICKS(250));
+        speaker_tone(800, 200);
+        vTaskDelay(pdMS_TO_TICKS(250));
+        speaker_tone(400, 200);
+        #endif
+
+        return ESP_FAIL;
+    }
+}
+
+// Task to continuously attempt upload in Station Mode
+void upload_task(void *pvParameters)
+{
+    ESP_LOGI(TAG, "Upload task started. Waiting for WiFi connection...");
+
+    // Wait for WiFi to be connected
+    while (!wifi_connected) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+
+    ESP_LOGI(TAG, "WiFi connected. Starting upload attempts...");
+
+    while (1) {
+        esp_err_t result = upload_flight_data_to_webapp();
+
+        if (result == ESP_OK) {
+            ESP_LOGI(TAG, "Upload successful! Task complete.");
+            // Successfully uploaded, we can stop trying
+            vTaskDelete(NULL);
+            return;
+        }
+
+        // Wait before retry
+        ESP_LOGI(TAG, "Upload failed. Retrying in %d seconds...", CONFIG_BLUEBOX_UPLOAD_RETRY_INTERVAL_SEC);
+        vTaskDelay(pdMS_TO_TICKS(CONFIG_BLUEBOX_UPLOAD_RETRY_INTERVAL_SEC * 1000));
+    }
 }
 
 // HTTP handler for root path
@@ -616,12 +969,61 @@ void app_main(void)
                  (unsigned long)esp_get_free_heap_size(),
                  (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
 
-        // Start WiFi AP mode in separate task with large stack (10KB for PHY calibration)
-        ESP_LOGI(TAG, "Starting WiFi Access Point");
+        #ifdef CONFIG_BLUEBOX_RECOVERY_MODE_STATION
+        // Station Mode: Connect to WiFi network and upload data
+        ESP_LOGI(TAG, "Recovery Mode: STATION MODE");
+        ESP_LOGI(TAG, "Will connect to WiFi and upload to: %s", CONFIG_BLUEBOX_WEBAPP_URL);
+
         wifi_init_complete = false;
+        wifi_connected = false;
+
+        // Start WiFi Station mode task
         xTaskCreatePinnedToCore(
-            wifi_init_task,
-            "wifi_init",
+            wifi_init_station_task,
+            "wifi_station",
+            10240,  // 10KB stack for WiFi init and PHY calibration
+            NULL,
+            tskIDLE_PRIORITY + 2,
+            NULL,
+            1  // Core 1
+        );
+
+        // Wait for WiFi initialization to start
+        while (!wifi_init_complete) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+
+        ESP_LOGI(TAG, "Free heap after WiFi init: %lu bytes", (unsigned long)esp_get_free_heap_size());
+
+        // Start upload task (will wait for connection and retry indefinitely)
+        xTaskCreatePinnedToCore(
+            upload_task,
+            "upload_task",
+            8192,  // 8KB stack for HTTP client
+            NULL,
+            tskIDLE_PRIORITY + 1,
+            NULL,
+            1  // Core 1
+        );
+
+        ESP_LOGI(TAG, "Upload task started. Will automatically upload when WiFi connects.");
+
+        // Keep running (upload task and beep task continue in background)
+        while (1) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
+
+        #else
+        // AP Mode: Create access point for manual data retrieval
+        ESP_LOGI(TAG, "Recovery Mode: AP MODE");
+        ESP_LOGI(TAG, "Starting WiFi Access Point");
+
+        wifi_init_complete = false;
+        wifi_connected = false;
+
+        xTaskCreatePinnedToCore(
+            wifi_init_ap_task,
+            "wifi_ap",
             10240,  // 10KB stack for WiFi init and PHY calibration
             NULL,
             tskIDLE_PRIORITY + 2,
@@ -647,5 +1049,6 @@ void app_main(void)
                 vTaskDelay(pdMS_TO_TICKS(1000));
             }
         }
+        #endif
     }
 }
