@@ -71,10 +71,24 @@ app.layout = dbc.Container([
         ])
     ], id="delete-modal", is_open=False),
 
+    # Rename modal
+    dbc.Modal([
+        dbc.ModalHeader("Rename Flight"),
+        dbc.ModalBody([
+            dbc.Label("Flight Name"),
+            dbc.Input(id="rename-input", type="text", placeholder="Enter flight name", maxLength=100)
+        ]),
+        dbc.ModalFooter([
+            dbc.Button("Cancel", id="rename-cancel", color="secondary", className="me-2"),
+            dbc.Button("Save", id="rename-confirm", color="primary")
+        ])
+    ], id="rename-modal", is_open=False),
+
     # Store for selected flight data
     dcc.Store(id="selected-flight-data"),
     dcc.Store(id="selected-flight-id"),
     dcc.Store(id="delete-flight-id"),
+    dcc.Store(id="rename-flight-id"),
 
 ], fluid=True, className="p-4", style={"backgroundColor": "#222"})
 
@@ -112,6 +126,20 @@ def delete_flight_api(flight_id):
         return False
 
 
+def rename_flight_api(flight_id, new_name):
+    """Rename a flight via API."""
+    try:
+        response = requests.patch(
+            f"{API_URL}/api/flights/{flight_id}",
+            json={"flight_name": new_name}
+        )
+        response.raise_for_status()
+        return True
+    except Exception as e:
+        print(f"Error renaming flight: {e}")
+        return False
+
+
 @callback(
     Output("flight-list", "children"),
     Input("refresh-button", "n_clicks")
@@ -127,9 +155,21 @@ def update_flight_list(n_clicks):
     for flight in flights:
         created = datetime.fromisoformat(flight["created_at"].replace("Z", "+00:00"))
 
+        # Display flight name with pencil icon, or default to "Flight #id"
+        flight_name = flight.get('flight_name') or f"Flight #{flight['id']}"
+
         card = dbc.Card([
             dbc.CardBody([
-                html.H6(f"Flight #{flight['id']}", className="card-title"),
+                html.Div([
+                    html.H6(flight_name, className="card-title d-inline me-2", style={"marginBottom": "0"}),
+                    dbc.Button(
+                        "✎",  # Pencil icon
+                        id={"type": "rename-button", "index": flight["id"]},
+                        color="link",
+                        size="sm",
+                        style={"padding": "0", "fontSize": "16px", "verticalAlign": "baseline"}
+                    )
+                ], style={"display": "flex", "alignItems": "center"}),
                 html.P([
                     html.Small(f"Device: {flight['device_id'] or 'Unknown'}"),
                     html.Br(),
@@ -205,6 +245,7 @@ def display_flight(flight_data):
 
     # Extract metadata
     flight_id = flight_data["id"]
+    flight_name = flight_data.get("flight_name") or f"Flight #{flight_id}"
     device_id = flight_data["device_id"] or "Unknown"
     sample_count = flight_data["sample_count"]
     duration = flight_data["duration_seconds"]
@@ -258,7 +299,7 @@ def display_flight(flight_data):
     # Create graphs
     graphs = create_flight_graphs(df)
 
-    return f"Flight #{flight_id}", stats, graphs
+    return flight_name, stats, graphs
 
 
 def create_flight_graphs(df):
@@ -447,6 +488,76 @@ def delete_flight_confirmed(confirm_clicks, flight_id, current_clicks):
             return (current_clicks or 0) + 1
         else:
             print(f"Failed to delete flight {flight_id}")
+
+    return current_clicks or 0
+
+
+@callback(
+    [Output("rename-modal", "is_open"),
+     Output("rename-flight-id", "data"),
+     Output("rename-input", "value")],
+    [Input({"type": "rename-button", "index": ALL}, "n_clicks"),
+     Input("rename-cancel", "n_clicks"),
+     Input("rename-confirm", "n_clicks")],
+    [State({"type": "rename-button", "index": ALL}, "id"),
+     State("rename-flight-id", "data"),
+     State("rename-modal", "is_open"),
+     State("rename-input", "value")],
+    prevent_initial_call=True
+)
+def handle_rename_modal(rename_clicks, cancel_clicks, confirm_clicks, button_ids, stored_flight_id, is_open, input_value):
+    """Handle opening/closing the rename modal."""
+    ctx = dash.callback_context
+
+    if not ctx.triggered:
+        return is_open, stored_flight_id, input_value
+
+    trigger_id = ctx.triggered[0]["prop_id"].split(".")[0]
+
+    # Rename button clicked - open modal and store flight ID
+    if "rename-button" in trigger_id:
+        # Check if this is an actual click (not None)
+        trigger_value = ctx.triggered[0]["value"]
+        if trigger_value is None or trigger_value == 0:
+            return is_open, stored_flight_id, input_value
+
+        import json
+        button_data = json.loads(trigger_id)
+        flight_id = button_data["index"]
+
+        # Fetch current flight name
+        flight_data = fetch_flight_data(flight_id)
+        current_name = ""
+        if flight_data:
+            current_name = flight_data.get("flight_name") or ""
+
+        return True, flight_id, current_name
+
+    # Cancel or confirm clicked - close modal
+    if trigger_id in ["rename-cancel", "rename-confirm"]:
+        return False, stored_flight_id, ""
+
+    return is_open, stored_flight_id, input_value
+
+
+@callback(
+    Output("refresh-button", "n_clicks", allow_duplicate=True),
+    Input("rename-confirm", "n_clicks"),
+    State("rename-flight-id", "data"),
+    State("rename-input", "value"),
+    State("refresh-button", "n_clicks"),
+    prevent_initial_call=True
+)
+def rename_flight_confirmed(confirm_clicks, flight_id, new_name, current_clicks):
+    """Rename the flight when user confirms and trigger refresh."""
+    if flight_id is not None and new_name:
+        success = rename_flight_api(flight_id, new_name)
+        if success:
+            print(f"Successfully renamed flight {flight_id} to '{new_name}'")
+            # Trigger refresh by incrementing the refresh button clicks
+            return (current_clicks or 0) + 1
+        else:
+            print(f"Failed to rename flight {flight_id}")
 
     return current_clicks or 0
 

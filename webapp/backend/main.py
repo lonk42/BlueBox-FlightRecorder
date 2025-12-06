@@ -8,9 +8,13 @@ import math
 
 from database import engine, get_db, Base
 from models import FlightRecording
+from migrations import run_migrations
 
 # Create database tables
 Base.metadata.create_all(bind=engine)
+
+# Run database migrations
+run_migrations()
 
 app = FastAPI(
     title="BlueBox Flight Recorder API",
@@ -59,6 +63,7 @@ class FlightData(BaseModel):
 class FlightRecordingResponse(BaseModel):
     id: int
     device_id: Optional[str]
+    flight_name: Optional[str]
     created_at: datetime
     duration_seconds: Optional[float]
     sample_count: Optional[int]
@@ -67,6 +72,10 @@ class FlightRecordingResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class UpdateFlightName(BaseModel):
+    flight_name: str = Field(..., description="New name for the flight", min_length=1, max_length=100)
 
 
 @app.get("/")
@@ -170,6 +179,7 @@ def get_flight(flight_id: int, db: Session = Depends(get_db)):
     return {
         "id": recording.id,
         "device_id": recording.device_id,
+        "flight_name": recording.flight_name,
         "created_at": recording.created_at,
         "duration_seconds": recording.duration_seconds,
         "sample_count": recording.sample_count,
@@ -177,6 +187,25 @@ def get_flight(flight_id: int, db: Session = Depends(get_db)):
         "max_accel_magnitude": recording.max_accel_magnitude,
         "data": recording.data
     }
+
+
+@app.patch("/api/flights/{flight_id}", response_model=FlightRecordingResponse)
+def update_flight_name(flight_id: int, update_data: UpdateFlightName, db: Session = Depends(get_db)):
+    """
+    Update the name of a specific flight recording.
+    """
+    recording = db.query(FlightRecording).filter(
+        FlightRecording.id == flight_id
+    ).first()
+
+    if not recording:
+        raise HTTPException(status_code=404, detail="Flight not found")
+
+    recording.flight_name = update_data.flight_name
+    db.commit()
+    db.refresh(recording)
+
+    return recording
 
 
 @app.delete("/api/flights/{flight_id}")

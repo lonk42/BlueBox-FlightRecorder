@@ -10,6 +10,7 @@ class FlightRecording(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     device_id = Column(String, index=True, nullable=True)  # Device identifier (if provided)
+    flight_name = Column(String, nullable=True)  # User-assigned flight name
     created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
 
     # Flight metadata (extracted from samples)

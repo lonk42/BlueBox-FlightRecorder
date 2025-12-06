@@ -115,21 +115,22 @@ The app uses Dash callbacks for interactivity. To add new visualizations:
 
 ### Database Migrations
 
-For schema changes, consider using Alembic:
+Database migrations run automatically on backend startup. Schema changes are defined in `backend/migrations.py`.
 
-```bash
-cd backend
-pip install alembic
+To add a new migration, append to the `MIGRATIONS` list:
 
-# Initialize Alembic
-alembic init alembic
-
-# Create migration
-alembic revision --autogenerate -m "Add new column"
-
-# Apply migration
-alembic upgrade head
+```python
+MIGRATIONS = [
+    # ... existing migrations ...
+    {
+        "version": "002",
+        "description": "Add new column",
+        "sql": "ALTER TABLE flight_recordings ADD COLUMN IF NOT EXISTS new_column VARCHAR;"
+    },
+]
 ```
+
+Always use `IF NOT EXISTS` to make migrations idempotent (safe to run multiple times).
 
 ## API Endpoints
 
@@ -156,6 +157,13 @@ Returns: Array of flight metadata
 ```
 GET /api/flights/{flight_id}
 Returns: Full flight data with all samples
+```
+
+### Rename Flight
+```
+PATCH /api/flights/{flight_id}
+Body: { "flight_name": "My Flight Name" }
+Returns: Updated flight metadata
 ```
 
 ### Delete Flight

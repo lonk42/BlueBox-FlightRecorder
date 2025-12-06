@@ -33,6 +33,9 @@ webapp/frontend/.env
 # Docker
 docker-compose.override.yml
 .dockerignore
+***C*E.md
+C*Y.md
+.c*e/
 
 # IDE
 .vscode/
