@@ -1,0 +1,13 @@
+apiVersion: v2
+name: bluebox
+description: BlueBox Flight Recorder - Web application for flight data visualization
+type: application
+version: 1.0.0
+appVersion: "1.0.0"
+keywords:
+  - bluebox
+  - flight-recorder
+  - data-visualization
+  - esp32
+maintainers:
+  - name: BlueBox Team

@@ -1,0 +1,75 @@
+***********************************************
+*  BlueBox Flight Recorder has been deployed! *
+***********************************************
+
+Your release is named {{ .Release.Name }}.
+
+To learn more about the release, try:
+
+  $ helm status {{ .Release.Name }} -n {{ .Values.global.namespace }}
+  $ helm get all {{ .Release.Name }} -n {{ .Values.global.namespace }}
+
+{{- if .Values.ingress.enabled }}
+
+1. The application will be available at:
+
+   {{- if .Values.ingress.tls.enabled }}
+   https://{{ .Values.ingress.host }}
+   {{- else }}
+   http://{{ .Values.ingress.host }}
+   {{- end }}
+
+   Dashboard: {{ if .Values.ingress.tls.enabled }}https{{ else }}http{{ end }}://{{ .Values.ingress.host }}/
+   API Docs:  {{ if .Values.ingress.tls.enabled }}https{{ else }}http{{ end }}://{{ .Values.ingress.host }}/api/docs
+
+{{- else }}
+
+1. Get the application URL by running these commands:
+
+   Frontend (Dashboard):
+   export POD_NAME=$(kubectl get pods -n {{ .Values.global.namespace }} -l "app.kubernetes.io/component=frontend,app.kubernetes.io/instance={{ .Release.Name }}" -o jsonpath="{.items[0].metadata.name}")
+   kubectl port-forward -n {{ .Values.global.namespace }} $POD_NAME 8050:8050
+   echo "Visit http://127.0.0.1:8050"
+
+   Backend (API):
+   export POD_NAME=$(kubectl get pods -n {{ .Values.global.namespace }} -l "app.kubernetes.io/component=backend,app.kubernetes.io/instance={{ .Release.Name }}" -o jsonpath="{.items[0].metadata.name}")
+   kubectl port-forward -n {{ .Values.global.namespace }} $POD_NAME 8000:8000
+   echo "Visit http://127.0.0.1:8000/docs"
+
+{{- end }}
+
+2. Check deployment status:
+
+   kubectl get pods -n {{ .Values.global.namespace }}
+   kubectl get svc -n {{ .Values.global.namespace }}
+
+3. View logs:
+
+   Backend:  kubectl logs -f deployment/{{ include "bluebox.fullname" . }}-backend -n {{ .Values.global.namespace }}
+   Frontend: kubectl logs -f deployment/{{ include "bluebox.fullname" . }}-frontend -n {{ .Values.global.namespace }}
+   Database: kubectl logs -f statefulset/{{ include "bluebox.fullname" . }}-postgresql -n {{ .Values.global.namespace }}
+
+4. Test data upload:
+
+   curl -X POST {{ if .Values.ingress.enabled }}{{ if .Values.ingress.tls.enabled }}https{{ else }}http{{ end }}://{{ .Values.ingress.host }}/api/flights{{ else }}http://localhost:8000/api/flights{{ end }} \
+     -H "Content-Type: application/json" \
+     -d '{"device_id":"test-device","samples":[{"t":0,"gx":0.1,"gy":-0.2,"gz":0.3,"ax":0.01,"ay":0.02,"az":1.0,"p":101325,"temp":22.5}]}'
+
+{{- if not .Values.ingress.enabled }}
+
+NOTE: Ingress is disabled. To enable external access, either:
+  - Enable ingress in values.yaml
+  - Expose services with LoadBalancer or NodePort
+  - Use port-forward for development/testing
+
+{{- end }}
+
+{{- if eq .Values.postgresql.auth.password "bluebox" }}
+
+WARNING: You are using the default database password!
+         Please change it in production by setting:
+         postgresql.auth.password in values.yaml
+
+{{- end }}
+
+Happy flying! ✈️

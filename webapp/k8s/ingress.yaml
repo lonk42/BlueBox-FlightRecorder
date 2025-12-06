@@ -1,0 +1,34 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: bluebox-ingress
+  namespace: bluebox
+  annotations:
+    # Uncomment and configure based on your ingress controller
+    # nginx.ingress.kubernetes.io/rewrite-target: /
+    # cert-manager.io/cluster-issuer: "letsencrypt-prod"  # For TLS
+spec:
+  ingressClassName: nginx  # Adjust based on your ingress controller
+  rules:
+  - host: bluebox.yourdomain.com  # Replace with your domain
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: frontend
+            port:
+              number: 8050
+      - path: /api
+        pathType: Prefix
+        backend:
+          service:
+            name: backend
+            port:
+              number: 8000
+  # Uncomment for TLS
+  # tls:
+  # - hosts:
+  #   - bluebox.yourdomain.com
+  #   secretName: bluebox-tls

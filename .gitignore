@@ -1,7 +1,7 @@
 # ESP-IDF build artifacts
-build/
-sdkconfig
-sdkconfig.old
+firmware/build/
+firmware/sdkconfig
+firmware/sdkconfig.old
 *.swp
 *.swo
 *~
@@ -9,12 +9,43 @@ sdkconfig.old
 # Python
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+venv/
+env/
+ENV/
+.venv
+
+# Web application
+webapp/backend/.env
+webapp/frontend/.env
+*.db
+*.sqlite
+*.sqlite3
+
+# Docker
+docker-compose.override.yml
+.dockerignore
 
 # IDE
 .vscode/
 .idea/
 *.code-workspace
+.DS_Store
 
 # Dependencies
 dependencies.lock
 managed_components/
+
+# Logs
+*.log
+logs/
+
+# Database
+postgres_data/

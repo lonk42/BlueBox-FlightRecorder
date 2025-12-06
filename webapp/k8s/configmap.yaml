@@ -1,0 +1,29 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bluebox-config
+  namespace: bluebox
+data:
+  # PostgreSQL configuration
+  POSTGRES_DB: "bluebox"
+  POSTGRES_USER: "bluebox"
+
+  # Backend configuration
+  DATABASE_URL: "postgresql://bluebox:bluebox@postgres:5432/bluebox"
+  API_HOST: "0.0.0.0"
+  API_PORT: "8000"
+
+  # Frontend configuration
+  API_URL: "http://backend:8000"
+  FRONTEND_HOST: "0.0.0.0"
+  FRONTEND_PORT: "8050"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: bluebox-secrets
+  namespace: bluebox
+type: Opaque
+stringData:
+  # PostgreSQL password (change in production!)
+  POSTGRES_PASSWORD: "bluebox"
