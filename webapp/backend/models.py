@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, DateTime, JSON, Float
+from sqlalchemy import Column, Integer, String, DateTime, JSON, Float, BigInteger
 from sqlalchemy.sql import func
 from database import Base
 
@@ -18,6 +18,10 @@ class FlightRecording(Base):
     sample_count = Column(Integer, nullable=True)
     max_gyro_magnitude = Column(Float, nullable=True)
     max_accel_magnitude = Column(Float, nullable=True)
+
+    # Phase transition timestamps (microseconds since device boot)
+    launch_time_us = Column(BigInteger, nullable=True)  # Timestamp when launch detected
+    landing_time_us = Column(BigInteger, nullable=True)  # Timestamp when landing detected
 
     # Raw JSON data from BlueBox
     data = Column(JSON, nullable=False)

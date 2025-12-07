@@ -23,6 +23,17 @@ MIGRATIONS = [
             ADD COLUMN IF NOT EXISTS flight_name VARCHAR;
         """
     },
+    {
+        "version": "002",
+        "description": "Add phase transition timestamps",
+        "sql": """
+            ALTER TABLE flight_recordings
+            ADD COLUMN IF NOT EXISTS launch_time_us BIGINT;
+
+            ALTER TABLE flight_recordings
+            ADD COLUMN IF NOT EXISTS landing_time_us BIGINT;
+        """
+    },
 ]
 
 

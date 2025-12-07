@@ -42,6 +42,11 @@ class GPSData(BaseModel):
     sat: int
 
 
+class PhaseTransitions(BaseModel):
+    launch: Optional[int] = Field(None, description="Launch timestamp (microseconds)")
+    landing: Optional[int] = Field(None, description="Landing timestamp (microseconds)")
+
+
 class FlightSample(BaseModel):
     t: int = Field(..., description="Timestamp in microseconds")
     gx: float = Field(..., description="Gyro X (deg/s)")
@@ -58,6 +63,7 @@ class FlightSample(BaseModel):
 class FlightData(BaseModel):
     samples: List[FlightSample]
     device_id: Optional[str] = Field(None, description="Device identifier")
+    phase_transitions: Optional[PhaseTransitions] = Field(None, description="Flight phase transitions")
 
 
 class FlightRecordingResponse(BaseModel):
@@ -69,6 +75,8 @@ class FlightRecordingResponse(BaseModel):
     sample_count: Optional[int]
     max_gyro_magnitude: Optional[float]
     max_accel_magnitude: Optional[float]
+    launch_time_us: Optional[int]
+    landing_time_us: Optional[int]
 
     class Config:
         from_attributes = True
@@ -120,6 +128,13 @@ def upload_flight(flight_data: FlightData, db: Session = Depends(get_db)):
         mag = math.sqrt(sample.ax**2 + sample.ay**2 + sample.az**2)
         max_accel_mag = max(max_accel_mag, mag)
 
+    # Extract phase transitions if available
+    launch_time = None
+    landing_time = None
+    if flight_data.phase_transitions:
+        launch_time = flight_data.phase_transitions.launch
+        landing_time = flight_data.phase_transitions.landing
+
     # Create database record
     recording = FlightRecording(
         device_id=flight_data.device_id,
@@ -127,6 +142,8 @@ def upload_flight(flight_data: FlightData, db: Session = Depends(get_db)):
         sample_count=sample_count,
         max_gyro_magnitude=max_gyro_mag,
         max_accel_magnitude=max_accel_mag,
+        launch_time_us=launch_time,
+        landing_time_us=landing_time,
         data=flight_data.model_dump()  # Store full JSON
     )
 
@@ -185,6 +202,8 @@ def get_flight(flight_id: int, db: Session = Depends(get_db)):
         "sample_count": recording.sample_count,
         "max_gyro_magnitude": recording.max_gyro_magnitude,
         "max_accel_magnitude": recording.max_accel_magnitude,
+        "launch_time_us": recording.launch_time_us,
+        "landing_time_us": recording.landing_time_us,
         "data": recording.data
     }
 

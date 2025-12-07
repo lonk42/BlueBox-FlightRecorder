@@ -37,6 +37,10 @@ typedef enum {
 static bluebox_state_t current_state = STATE_INIT;
 static volatile bool upload_in_progress = false;
 
+// Phase transition timestamps for webapp visualization
+static int64_t launch_time_us = 0;   // Timestamp when launch detected
+static int64_t landing_time_us = 0;  // Timestamp when landing detected
+
 // Launch detection parameters
 #define LAUNCH_GYRO_THRESHOLD 300.0f      // deg/s - threshold for launch detection
 #define LAUNCH_DETECTION_DURATION_MS 350  // 350ms of sustained high acceleration
@@ -151,6 +155,7 @@ void sensor_task(void *pvParameters)
                         in_high_accel = true;
                     } else if ((now - high_accel_start_time) > (LAUNCH_DETECTION_DURATION_MS * 1000)) {
                         launch_time = now;  // Record launch time for flight duration tracking
+                        launch_time_us = now;  // Record for phase transition tracking
                         ESP_LOGI(TAG, "LAUNCH DETECTED! Gyro magnitude: %.1f deg/s", gyro_magnitude);
 
                         // Flush pre-launch RAM buffer to flash
@@ -234,6 +239,7 @@ void sensor_task(void *pvParameters)
                                  POST_LANDING_RECORD_MS / 1000.0f);
                         landing_detected = true;
                         landing_detected_time = now;
+                        landing_time_us = now;  // Record for phase transition tracking
                     }
                 } else if (!landing_detected) {
                     is_stable = false;
@@ -628,12 +634,14 @@ esp_err_t upload_flight_data_to_webapp(void)
     } while(0)
 
     // Write JSON header as first chunk
-    int header_len = snprintf(chunk_buffer, chunk_buffer_size, "{\"device_id\":\"%s\",\"samples\":[",
+    int header_len = snprintf(chunk_buffer, chunk_buffer_size,
+        "{\"device_id\":\"%s\",\"phase_transitions\":{\"launch\":%lld,\"landing\":%lld},\"samples\":[",
     #ifdef CONFIG_BLUEBOX_DEVICE_ID
-        CONFIG_BLUEBOX_DEVICE_ID
+        CONFIG_BLUEBOX_DEVICE_ID,
     #else
-        "bluebox-001"
+        "bluebox-001",
     #endif
+        launch_time_us, landing_time_us
     );
     WRITE_CHUNK(chunk_buffer, header_len);
 
@@ -810,7 +818,14 @@ esp_err_t data_get_handler(httpd_req_t *req)
     httpd_resp_set_hdr(req, "Content-Disposition", "attachment; filename=\"bluebox-flight-data.json\"");
 
     ESP_LOGI(TAG, "Sending JSON header...");
-    esp_err_t ret = httpd_resp_sendstr_chunk(req, "{\"samples\":[");
+
+    // Format header with phase transitions
+    char header_buf[256];
+    snprintf(header_buf, sizeof(header_buf),
+             "{\"phase_transitions\":{\"launch\":%lld,\"landing\":%lld},\"samples\":[",
+             launch_time_us, landing_time_us);
+
+    esp_err_t ret = httpd_resp_sendstr_chunk(req, header_buf);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to send JSON header: %s", esp_err_to_name(ret));
         return ret;

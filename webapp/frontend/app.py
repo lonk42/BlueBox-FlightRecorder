@@ -296,14 +296,26 @@ def display_flight(flight_data):
     if len(df) > 0:
         df["time_s"] = (df["t"] - df["t"].iloc[0]) / 1_000_000.0
 
+    # Extract phase transitions if available
+    launch_time_us = flight_data.get("launch_time_us")
+    landing_time_us = flight_data.get("landing_time_us")
+
+    # Convert phase transitions to seconds relative to flight start
+    launch_time_s = None
+    landing_time_s = None
+    if len(df) > 0 and launch_time_us is not None:
+        launch_time_s = (launch_time_us - df["t"].iloc[0]) / 1_000_000.0
+    if len(df) > 0 and landing_time_us is not None:
+        landing_time_s = (landing_time_us - df["t"].iloc[0]) / 1_000_000.0
+
     # Create graphs
-    graphs = create_flight_graphs(df)
+    graphs = create_flight_graphs(df, launch_time_s, landing_time_s)
 
     return flight_name, stats, graphs
 
 
-def create_flight_graphs(df):
-    """Create interactive Plotly graphs for flight data."""
+def create_flight_graphs(df, launch_time_s=None, landing_time_s=None):
+    """Create interactive Plotly graphs for flight data with phase transitions."""
     if df.empty:
         return dbc.Alert("No sample data available.", color="warning")
 
@@ -314,6 +326,15 @@ def create_flight_graphs(df):
     fig_gyro.add_trace(go.Scatter(x=df["time_s"], y=df["gx"], name="Gyro X", line=dict(color="#EF553B")))
     fig_gyro.add_trace(go.Scatter(x=df["time_s"], y=df["gy"], name="Gyro Y", line=dict(color="#00CC96")))
     fig_gyro.add_trace(go.Scatter(x=df["time_s"], y=df["gz"], name="Gyro Z", line=dict(color="#636EFA")))
+
+    # Add phase transition markers
+    if launch_time_s is not None:
+        fig_gyro.add_vline(x=launch_time_s, line_dash="dash", line_color="#00FF00",
+                          annotation_text="Launch", annotation_position="top")
+    if landing_time_s is not None:
+        fig_gyro.add_vline(x=landing_time_s, line_dash="dash", line_color="#FF0000",
+                          annotation_text="Landing", annotation_position="top")
+
     fig_gyro.update_layout(
         title="Gyroscope (deg/s)",
         xaxis_title="Time (s)",
@@ -329,6 +350,15 @@ def create_flight_graphs(df):
     fig_accel.add_trace(go.Scatter(x=df["time_s"], y=df["ax"], name="Accel X", line=dict(color="#EF553B")))
     fig_accel.add_trace(go.Scatter(x=df["time_s"], y=df["ay"], name="Accel Y", line=dict(color="#00CC96")))
     fig_accel.add_trace(go.Scatter(x=df["time_s"], y=df["az"], name="Accel Z", line=dict(color="#636EFA")))
+
+    # Add phase transition markers
+    if launch_time_s is not None:
+        fig_accel.add_vline(x=launch_time_s, line_dash="dash", line_color="#00FF00",
+                           annotation_text="Launch", annotation_position="top")
+    if landing_time_s is not None:
+        fig_accel.add_vline(x=landing_time_s, line_dash="dash", line_color="#FF0000",
+                           annotation_text="Landing", annotation_position="top")
+
     fig_accel.update_layout(
         title="Accelerometer (g)",
         xaxis_title="Time (s)",
@@ -353,6 +383,18 @@ def create_flight_graphs(df):
         go.Scatter(x=df["time_s"], y=df["temp"], name="Temperature", line=dict(color="#FFA15A")),
         row=2, col=1
     )
+    # Add phase transition markers to environmental graphs
+    if launch_time_s is not None:
+        fig_env.add_vline(x=launch_time_s, line_dash="dash", line_color="#00FF00",
+                         annotation_text="Launch", annotation_position="top", row=1, col=1)
+        fig_env.add_vline(x=launch_time_s, line_dash="dash", line_color="#00FF00",
+                         row=2, col=1)
+    if landing_time_s is not None:
+        fig_env.add_vline(x=landing_time_s, line_dash="dash", line_color="#FF0000",
+                         annotation_text="Landing", annotation_position="top", row=1, col=1)
+        fig_env.add_vline(x=landing_time_s, line_dash="dash", line_color="#FF0000",
+                         row=2, col=1)
+
     fig_env.update_xaxes(title_text="Time (s)", row=2, col=1)
     fig_env.update_yaxes(title_text="Pressure (kPa)", row=1, col=1)
     fig_env.update_yaxes(title_text="Temperature (°C)", row=2, col=1)
@@ -419,6 +461,15 @@ def create_flight_graphs(df):
                 marker=dict(size=6),
                 name="Altitude"
             ))
+
+            # Add phase transition markers
+            if launch_time_s is not None:
+                fig_alt.add_vline(x=launch_time_s, line_dash="dash", line_color="#00FF00",
+                                 annotation_text="Launch", annotation_position="top")
+            if landing_time_s is not None:
+                fig_alt.add_vline(x=landing_time_s, line_dash="dash", line_color="#FF0000",
+                                 annotation_text="Landing", annotation_position="top")
+
             fig_alt.update_layout(
                 title="GPS Altitude Profile",
                 xaxis_title="Time (s)",

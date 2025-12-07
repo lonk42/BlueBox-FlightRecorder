@@ -172,8 +172,10 @@ esp_err_t bmp280_init(void)
         return ret;
     }
 
-    // Configure sensor: normal mode, oversampling x16 for both temp and pressure
-    ret = bmp280_write_reg(BMP280_REG_CTRL_MEAS, 0xB7);  // osrs_t=16, osrs_p=16, mode=normal
+    // Configure sensor: normal mode, oversampling x2 for both temp and pressure
+    // 2x oversampling: ~13.5ms per measurement = ~70Hz max rate
+    // Previous 16x/4x config: ~82.5ms per measurement = ~12Hz max rate
+    ret = bmp280_write_reg(BMP280_REG_CTRL_MEAS, 0x4B);  // osrs_t=2, osrs_p=2, mode=normal
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to configure sensor");
         return ret;
