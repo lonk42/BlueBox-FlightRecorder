@@ -11,7 +11,7 @@ static const char *TAG = "SPEAKER";
 #define LEDC_MODE               LEDC_LOW_SPEED_MODE
 #define LEDC_CHANNEL            LEDC_CHANNEL_0
 #define LEDC_DUTY_RES           LEDC_TIMER_13_BIT
-#define LEDC_DUTY               (4096)  // 50% duty cycle
+#define LEDC_DUTY               (4096)  // 50% duty cycle (optimal for piezo)
 #define LEDC_FREQUENCY          (1000)
 
 esp_err_t speaker_init(void)

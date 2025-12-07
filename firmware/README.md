@@ -86,17 +86,17 @@ BlueBox automatically transitions through three modes based on detected motion:
 - **Audio**:
   - Single beep every 3s = Waiting for GPS fix
   - Double beep every 3s = GPS locked, ready for flight!
-- **Behavior**: Records to 86KB RAM buffer (~1 second capacity), no flash wear
+- **Behavior**: Records to 120KB RAM buffer (~1.4 second capacity), no flash wear
 - **GPS Acquisition**: Module acquires satellites during this phase (cold start: 26-30 seconds)
-- **Transition**: Automatically enters Flight Mode when launch detected (gyro >150 deg/s for 250ms)
+- **Transition**: Automatically enters Flight Mode when launch detected (gyro >300 deg/s for 350ms)
 
 ### 2. Flight Mode (In-Flight)
 - **Audio**: Continuous 1500Hz tone
 - **Behavior**:
-  - Pre-launch RAM buffer (~1 second) flushed to flash
+  - Pre-launch RAM buffer (~1.4 seconds) flushed to flash
   - Continuous recording to flash (~26 seconds total capacity)
   - GPS data captured at 5Hz if fix acquired
-- **Transition**: Automatically enters Recovery Mode when landing detected (gyro <10 deg/s for 1 second)
+- **Transition**: Automatically enters Recovery Mode when landing detected (gyro <10 deg/s for 1 second, then records 1 more second post-landing)
 
 ### 3. Recovery Mode (Post-Flight)
 - **Audio**:
@@ -128,7 +128,7 @@ BlueBox automatically transitions through three modes based on detected motion:
 - **Core 0**: High-speed sensor polling (MPU6500: 1kHz, BMP280: 100Hz, GPS: 5Hz)
 - **Core 1**: State management, beep task, WiFi, HTTP server, GPS task
 - **Storage Strategy**:
-  - **Launch Mode**: 86KB RAM buffer (~1 second pre-launch data)
+  - **Launch Mode**: 120KB RAM buffer (~1.4 seconds pre-launch data)
   - **Flight Mode**: 2MB flash partition (~26 seconds total capacity)
   - **Sample Size**: 86 bytes (timestamp + IMU + BMP280 + GPS)
   - **Flash Partition Layout**:
@@ -142,8 +142,8 @@ BlueBox automatically transitions through three modes based on detected motion:
   - Pressure/temperature: ~100Hz
   - GPS (position/velocity): 5Hz
 - **State Machine**: Automatic transitions (Launch → Flight → Recovery) based on gyroscope data
-- **Launch Detection**: Gyro magnitude >150 deg/s for 250ms
-- **Landing Detection**: Gyro magnitude <10 deg/s for 1 second
+- **Launch Detection**: Gyro magnitude >300 deg/s for 350ms
+- **Landing Detection**: Gyro magnitude <10 deg/s for 1 second, then continues recording for 1 more second
 - **GPS Configuration**: 5Hz update rate, airborne <1g dynamic model
   - Cold start acquisition: ~26-30 seconds
   - Data: lat/lon (7 decimals), altitude, speed, heading, satellites

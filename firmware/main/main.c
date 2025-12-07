@@ -38,15 +38,16 @@ static bluebox_state_t current_state = STATE_INIT;
 static volatile bool upload_in_progress = false;
 
 // Launch detection parameters
-#define LAUNCH_GYRO_THRESHOLD 150.0f      // deg/s - threshold for launch detection
-#define LAUNCH_DETECTION_DURATION_MS 250  // 250ms of sustained high acceleration
+#define LAUNCH_GYRO_THRESHOLD 300.0f      // deg/s - threshold for launch detection
+#define LAUNCH_DETECTION_DURATION_MS 350  // 350ms of sustained high acceleration
 
 // Landing detection parameters
 #define LANDING_GYRO_THRESHOLD 10.0f      // deg/s - threshold for stable/landed
 #define LANDING_STABLE_DURATION_MS 1000   // 1 second of stability to consider landed
+#define POST_LANDING_RECORD_MS 1000       // 1 second of recording after landing detected
 
-// Buffer management for launch mode (1 second of data)
-#define LAUNCH_MODE_BUFFER_DURATION_MS 1000
+// Buffer management for launch mode (1.4 seconds of data to compensate for detection period)
+#define LAUNCH_MODE_BUFFER_DURATION_MS 1400
 
 // Sensor data structure
 typedef struct {
@@ -84,6 +85,8 @@ void sensor_task(void *pvParameters)
     // Landing detection
     int64_t stable_start_time = 0;
     bool is_stable = false;
+    int64_t landing_detected_time = 0;
+    bool landing_detected = false;
 
     while (current_state != STATE_RECOVERY_MODE && current_state != STATE_ERROR) {
         int64_t now = esp_timer_get_time();
@@ -204,25 +207,35 @@ void sensor_task(void *pvParameters)
             }
             // FLIGHT MODE: Monitor for landing
             else if (current_state == STATE_FLIGHT_MODE) {
-                // Check if gyro is stable (below threshold)
-                if (gyro_magnitude < LANDING_GYRO_THRESHOLD) {
+                // Check if landing already detected and post-landing recording period complete
+                if (landing_detected && (now - landing_detected_time) > (POST_LANDING_RECORD_MS * 1000)) {
+                    ESP_LOGI(TAG, "Post-landing recording complete (%.1f seconds)",
+                             (now - landing_detected_time) / 1000000.0f);
+
+                    // Flush any buffered data to flash
+                    flash_storage_flush();
+
+                    size_t bytes_written = flash_storage_get_bytes_written();
+                    size_t samples_stored = bytes_written / sizeof(sensor_sample_t);
+                    ESP_LOGI(TAG, "Flight complete! Flash: %zu bytes, %zu samples", bytes_written, samples_stored);
+                    current_state = STATE_RECOVERY_MODE;
+                    speaker_stop();  // Stop flight mode tone
+                    break;
+                }
+
+                // Check if gyro is stable (below threshold) - initial landing detection
+                if (!landing_detected && gyro_magnitude < LANDING_GYRO_THRESHOLD) {
                     if (!is_stable) {
                         stable_start_time = now;
                         is_stable = true;
                     } else if ((now - stable_start_time) > (LANDING_STABLE_DURATION_MS * 1000)) {
                         ESP_LOGI(TAG, "LANDING DETECTED! Gyro stabilized at %.1f deg/s", gyro_magnitude);
-
-                        // Flush any buffered data to flash
-                        flash_storage_flush();
-
-                        size_t bytes_written = flash_storage_get_bytes_written();
-                        size_t samples_stored = bytes_written / sizeof(sensor_sample_t);
-                        ESP_LOGI(TAG, "Flight complete! Flash: %zu bytes, %zu samples", bytes_written, samples_stored);
-                        current_state = STATE_RECOVERY_MODE;
-                        speaker_stop();  // Stop flight mode tone
-                        break;
+                        ESP_LOGI(TAG, "Continuing to record for %.1f more seconds...",
+                                 POST_LANDING_RECORD_MS / 1000.0f);
+                        landing_detected = true;
+                        landing_detected_time = now;
                     }
-                } else {
+                } else if (!landing_detected) {
                     is_stable = false;
                 }
 
@@ -545,8 +558,9 @@ esp_err_t upload_flight_data_to_webapp(void)
              upload_sample_count);
 
     // We'll stream JSON manually using proper chunked encoding
-    // Allocate buffer for building JSON chunks
-    char *chunk_buffer = malloc(4096);
+    // Allocate larger buffer for batching samples (16KB for better performance)
+    const size_t chunk_buffer_size = 16 * 1024;  // 16KB buffer
+    char *chunk_buffer = malloc(chunk_buffer_size);
     if (!chunk_buffer) {
         ESP_LOGE(TAG, "Failed to allocate chunk buffer");
         cJSON_Delete(root);
@@ -561,13 +575,13 @@ esp_err_t upload_flight_data_to_webapp(void)
     // Check if URL is HTTPS
     bool is_https = (strncmp(url, "https://", 8) == 0);
 
-    // Configure HTTP client
+    // Configure HTTP client with larger buffers for better performance
     esp_http_client_config_t config = {
         .url = url,
         .method = HTTP_METHOD_POST,
         .timeout_ms = 120000,  // 2 minute timeout for large uploads
-        .buffer_size = 4096,
-        .buffer_size_tx = 4096,
+        .buffer_size = 16384,      // 16KB RX buffer
+        .buffer_size_tx = 16384,   // 16KB TX buffer
         .is_async = false,
     };
 
@@ -614,7 +628,7 @@ esp_err_t upload_flight_data_to_webapp(void)
     } while(0)
 
     // Write JSON header as first chunk
-    int header_len = snprintf(chunk_buffer, 4096, "{\"device_id\":\"%s\",\"samples\":[",
+    int header_len = snprintf(chunk_buffer, chunk_buffer_size, "{\"device_id\":\"%s\",\"samples\":[",
     #ifdef CONFIG_BLUEBOX_DEVICE_ID
         CONFIG_BLUEBOX_DEVICE_ID
     #else
@@ -623,8 +637,12 @@ esp_err_t upload_flight_data_to_webapp(void)
     );
     WRITE_CHUNK(chunk_buffer, header_len);
 
-    // Stream samples
+    // Stream samples with batching for better performance
+    // Accumulate samples in buffer, write when buffer is ~80% full
     sensor_sample_t sample;
+    size_t buffer_pos = 0;  // Current position in chunk_buffer
+    const size_t buffer_threshold = (chunk_buffer_size * 4) / 5;  // 80% of buffer size
+
     for (size_t i = 0; i < sample_count; i += decimation_factor) {
         if (i > 0 && i % 1000 == 0) {
             ESP_LOGI(TAG, "Uploaded %zu / %zu samples", i / decimation_factor, upload_sample_count);
@@ -634,7 +652,7 @@ esp_err_t upload_flight_data_to_webapp(void)
         if (flash_storage_read(offset, &sample, sizeof(sensor_sample_t)) == ESP_OK) {
             int sample_len;
             if (sample.gps_valid) {
-                sample_len = snprintf(chunk_buffer, 4096,
+                sample_len = snprintf(chunk_buffer + buffer_pos, chunk_buffer_size - buffer_pos,
                     "%s{\"t\":%lld,\"gx\":%.2f,\"gy\":%.2f,\"gz\":%.2f,\"ax\":%.2f,\"ay\":%.2f,\"az\":%.2f,\"p\":%.2f,\"temp\":%.2f,\"gps\":{\"lat\":%.7f,\"lon\":%.7f,\"alt\":%.1f,\"spd\":%.1f,\"hdg\":%.1f,\"sat\":%u}}",
                     (i > 0) ? "," : "",
                     sample.timestamp_us,
@@ -644,7 +662,7 @@ esp_err_t upload_flight_data_to_webapp(void)
                     sample.gps_latitude, sample.gps_longitude, sample.gps_altitude,
                     sample.gps_speed_kmh, sample.gps_heading, sample.gps_satellites);
             } else {
-                sample_len = snprintf(chunk_buffer, 4096,
+                sample_len = snprintf(chunk_buffer + buffer_pos, chunk_buffer_size - buffer_pos,
                     "%s{\"t\":%lld,\"gx\":%.2f,\"gy\":%.2f,\"gz\":%.2f,\"ax\":%.2f,\"ay\":%.2f,\"az\":%.2f,\"p\":%.2f,\"temp\":%.2f}",
                     (i > 0) ? "," : "",
                     sample.timestamp_us,
@@ -652,8 +670,20 @@ esp_err_t upload_flight_data_to_webapp(void)
                     sample.accel_x, sample.accel_y, sample.accel_z,
                     sample.pressure, sample.temperature);
             }
-            WRITE_CHUNK(chunk_buffer, sample_len);
+
+            buffer_pos += sample_len;
+
+            // If buffer is getting full, write it as a chunk and reset
+            if (buffer_pos >= buffer_threshold) {
+                WRITE_CHUNK(chunk_buffer, buffer_pos);
+                buffer_pos = 0;
+            }
         }
+    }
+
+    // Write any remaining samples in buffer
+    if (buffer_pos > 0) {
+        WRITE_CHUNK(chunk_buffer, buffer_pos);
     }
 
     // Write JSON footer
@@ -986,9 +1016,9 @@ void app_main(void)
     ESP_LOGI(TAG, "Flash storage initialized: %zu bytes capacity", flash_capacity);
     ESP_LOGI(TAG, "Can store ~%zu samples (~%.1f seconds of flight data)", max_samples, max_seconds);
 
-    // Create RAM buffer for Launch Mode (1 second of data before launch)
-    // At 1kHz: 1000 samples × 86 bytes = ~86KB
-    size_t launch_buffer_size = 86 * 1024;  // 86KB buffer
+    // Create RAM buffer for Launch Mode (1.4 seconds of data before launch)
+    // At 1kHz: 1400 samples × 86 bytes = ~120KB
+    size_t launch_buffer_size = 120 * 1024;  // 120KB buffer
     launch_buffer = circular_buffer_create(launch_buffer_size);
 
     if (launch_buffer == NULL) {
