@@ -252,41 +252,103 @@ def display_flight(flight_data):
     max_gyro = flight_data["max_gyro_magnitude"]
     max_accel = flight_data["max_accel_magnitude"]
 
-    # Flight statistics
-    stats = dbc.Row([
-        dbc.Col([
-            dbc.Card([
-                dbc.CardBody([
-                    html.H6("Device", className="text-muted"),
-                    html.H4(device_id)
+    # Calculate additional max values from samples data
+    samples = flight_data["data"]["samples"]
+    df_temp = pd.DataFrame(samples)
+
+    # Calculate derived metrics for max values
+    import numpy as np
+    max_altitude = None
+    max_vertical_speed = None
+
+    if len(df_temp) > 0:
+        # Calculate altitude from pressure
+        p0 = 101325.0
+        df_temp['altitude_m'] = 44330 * (1 - (df_temp['p'] / p0) ** (1/5.255))
+        max_altitude = df_temp['altitude_m'].max()
+
+        # Calculate vertical speed
+        if len(df_temp) > 1:
+            df_temp['time_s'] = (df_temp['t'] - df_temp['t'].iloc[0]) / 1_000_000.0
+            dt = df_temp['time_s'].diff()
+            dh = df_temp['altitude_m'].diff()
+            df_temp['vertical_speed'] = (dh / dt).fillna(0)
+            max_vertical_speed = df_temp['vertical_speed'].max()
+
+    # Flight statistics - two rows
+    stats = html.Div([
+        # Row 1: Basic info
+        dbc.Row([
+            dbc.Col([
+                dbc.Card([
+                    dbc.CardBody([
+                        html.H6("Device", className="text-muted"),
+                        html.H4(device_id)
+                    ])
                 ])
-            ])
-        ], width=3),
-        dbc.Col([
-            dbc.Card([
-                dbc.CardBody([
-                    html.H6("Samples", className="text-muted"),
-                    html.H4(f"{sample_count:,}")
+            ], width=3),
+            dbc.Col([
+                dbc.Card([
+                    dbc.CardBody([
+                        html.H6("Samples", className="text-muted"),
+                        html.H4(f"{sample_count:,}")
+                    ])
                 ])
-            ])
-        ], width=3),
-        dbc.Col([
-            dbc.Card([
-                dbc.CardBody([
-                    html.H6("Duration", className="text-muted"),
-                    html.H4(f"{duration:.2f}s" if duration else "N/A")
+            ], width=3),
+            dbc.Col([
+                dbc.Card([
+                    dbc.CardBody([
+                        html.H6("Duration", className="text-muted"),
+                        html.H4(f"{duration:.2f}s" if duration else "N/A")
+                    ])
                 ])
-            ])
-        ], width=3),
-        dbc.Col([
-            dbc.Card([
-                dbc.CardBody([
-                    html.H6("Max Gyro", className="text-muted"),
-                    html.H4(f"{max_gyro:.1f}°/s" if max_gyro else "N/A")
+            ], width=3),
+            dbc.Col([
+                dbc.Card([
+                    dbc.CardBody([
+                        html.H6("Max Altitude", className="text-muted"),
+                        html.H4(f"{max_altitude:.1f}m" if max_altitude is not None else "N/A")
+                    ])
                 ])
-            ])
-        ], width=3),
-    ], className="g-2")
+            ], width=3),
+        ], className="g-2 mb-2"),
+
+        # Row 2: Max values
+        dbc.Row([
+            dbc.Col([
+                dbc.Card([
+                    dbc.CardBody([
+                        html.H6("Max Gyro", className="text-muted"),
+                        html.H4(f"{max_gyro:.1f}°/s" if max_gyro else "N/A")
+                    ])
+                ], style={"backgroundColor": "#2d3e50"})
+            ], width=3),
+            dbc.Col([
+                dbc.Card([
+                    dbc.CardBody([
+                        html.H6("Max Accel", className="text-muted"),
+                        html.H4(f"{max_accel:.1f}g" if max_accel else "N/A")
+                    ])
+                ], style={"backgroundColor": "#2d3e50"})
+            ], width=3),
+            dbc.Col([
+                dbc.Card([
+                    dbc.CardBody([
+                        html.H6("Max Vertical Speed", className="text-muted"),
+                        html.H4(f"{max_vertical_speed:.1f}m/s" if max_vertical_speed is not None else "N/A")
+                    ])
+                ], style={"backgroundColor": "#2d3e50"})
+            ], width=3),
+            dbc.Col([
+                dbc.Card([
+                    dbc.CardBody([
+                        html.H6("Sample Rate", className="text-muted"),
+                        html.H4(f"{sample_count/duration:.0f}Hz" if duration and duration > 0 else "N/A")
+                    ])
+                ], style={"backgroundColor": "#2d3e50"})
+            ], width=3),
+        ], className="g-2"),
+    ])
 
     # Parse samples data
     samples = flight_data["data"]["samples"]
@@ -318,6 +380,29 @@ def create_flight_graphs(df, launch_time_s=None, landing_time_s=None):
     """Create interactive Plotly graphs for flight data with phase transitions."""
     if df.empty:
         return dbc.Alert("No sample data available.", color="warning")
+
+    # Calculate derived metrics
+    import numpy as np
+
+    # Angular velocity magnitude
+    df['gyro_mag'] = np.sqrt(df['gx']**2 + df['gy']**2 + df['gz']**2)
+
+    # Acceleration magnitude
+    df['accel_mag'] = np.sqrt(df['ax']**2 + df['ay']**2 + df['az']**2)
+
+    # Vertical speed from barometer (derivative of altitude)
+    # First calculate altitude from pressure using barometric formula
+    # p = p0 * (1 - L*h/T0)^(g*M/R*L)
+    # Simplified: altitude ≈ 44330 * (1 - (p/p0)^(1/5.255))
+    p0 = 101325.0  # Sea level pressure in Pa
+    df['altitude_m'] = 44330 * (1 - (df['p'] / p0) ** (1/5.255))
+
+    # Calculate vertical speed (m/s) using finite differences
+    df['vertical_speed'] = 0.0
+    if len(df) > 1:
+        dt = df['time_s'].diff()  # Time delta in seconds
+        dh = df['altitude_m'].diff()  # Altitude delta in meters
+        df['vertical_speed'] = (dh / dt).fillna(0)
 
     graphs = []
 
@@ -369,7 +454,95 @@ def create_flight_graphs(df, launch_time_s=None, landing_time_s=None):
     )
     graphs.append(dcc.Graph(figure=fig_accel, config={"displayModeBar": False}))
 
-    # 3. Pressure and Temperature
+    # 3. Angular Velocity Magnitude
+    fig_gyro_mag = go.Figure()
+    fig_gyro_mag.add_trace(go.Scatter(
+        x=df["time_s"],
+        y=df["gyro_mag"],
+        name="Angular Velocity Magnitude",
+        line=dict(color="#FFA500", width=2),
+        fill='tozeroy',
+        fillcolor='rgba(255, 165, 0, 0.2)'
+    ))
+
+    # Add phase transition markers
+    if launch_time_s is not None:
+        fig_gyro_mag.add_vline(x=launch_time_s, line_dash="dash", line_color="#00FF00",
+                              annotation_text="Launch", annotation_position="top")
+    if landing_time_s is not None:
+        fig_gyro_mag.add_vline(x=landing_time_s, line_dash="dash", line_color="#FF0000",
+                              annotation_text="Landing", annotation_position="top")
+
+    fig_gyro_mag.update_layout(
+        title="Angular Velocity Magnitude (Total Rotation Rate)",
+        xaxis_title="Time (s)",
+        yaxis_title="Magnitude (deg/s)",
+        hovermode="x unified",
+        height=400,
+        template="plotly_dark"
+    )
+    graphs.append(dcc.Graph(figure=fig_gyro_mag, config={"displayModeBar": False}))
+
+    # 4. Acceleration Magnitude
+    fig_accel_mag = go.Figure()
+    fig_accel_mag.add_trace(go.Scatter(
+        x=df["time_s"],
+        y=df["accel_mag"],
+        name="Acceleration Magnitude",
+        line=dict(color="#00CED1", width=2),
+        fill='tozeroy',
+        fillcolor='rgba(0, 206, 209, 0.2)'
+    ))
+
+    # Add phase transition markers
+    if launch_time_s is not None:
+        fig_accel_mag.add_vline(x=launch_time_s, line_dash="dash", line_color="#00FF00",
+                               annotation_text="Launch", annotation_position="top")
+    if landing_time_s is not None:
+        fig_accel_mag.add_vline(x=landing_time_s, line_dash="dash", line_color="#FF0000",
+                               annotation_text="Landing", annotation_position="top")
+
+    fig_accel_mag.update_layout(
+        title="Acceleration Magnitude (Total G-Force)",
+        xaxis_title="Time (s)",
+        yaxis_title="Magnitude (g)",
+        hovermode="x unified",
+        height=400,
+        template="plotly_dark"
+    )
+    graphs.append(dcc.Graph(figure=fig_accel_mag, config={"displayModeBar": False}))
+
+    # 5. Vertical Speed from Barometer
+    fig_vspeed = go.Figure()
+    fig_vspeed.add_trace(go.Scatter(
+        x=df["time_s"],
+        y=df["vertical_speed"],
+        name="Vertical Speed",
+        line=dict(color="#FF6B6B", width=2)
+    ))
+
+    # Add zero line for reference
+    fig_vspeed.add_hline(y=0, line_dash="dot", line_color="gray", opacity=0.5)
+
+    # Add phase transition markers
+    if launch_time_s is not None:
+        fig_vspeed.add_vline(x=launch_time_s, line_dash="dash", line_color="#00FF00",
+                            annotation_text="Launch", annotation_position="top")
+    if landing_time_s is not None:
+        fig_vspeed.add_vline(x=landing_time_s, line_dash="dash", line_color="#FF0000",
+                            annotation_text="Landing", annotation_position="top")
+
+    fig_vspeed.update_layout(
+        title="Vertical Speed (from Barometer)",
+        xaxis_title="Time (s)",
+        yaxis_title="Vertical Speed (m/s)",
+        hovermode="x unified",
+        height=400,
+        template="plotly_dark"
+    )
+    graphs.append(dcc.Graph(figure=fig_vspeed, config={"displayModeBar": False}))
+
+    # 6. Pressure and Temperature
     fig_env = make_subplots(
         rows=2, cols=1,
         subplot_titles=("Barometric Pressure", "Temperature"),
@@ -401,7 +574,7 @@ def create_flight_graphs(df, launch_time_s=None, landing_time_s=None):
     fig_env.update_layout(height=500, hovermode="x unified", showlegend=False, template="plotly_dark")
     graphs.append(dcc.Graph(figure=fig_env, config={"displayModeBar": False}))
 
-    # 4. GPS trajectory (if GPS data available)
+    # 7. GPS trajectory (if GPS data available)
     if "gps" in df.columns and df["gps"].notna().any():
         # Extract GPS coordinates
         gps_data = []
